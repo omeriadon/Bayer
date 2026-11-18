@@ -3,7 +3,7 @@ import SwiftUI
 
 /// The settings that used to live in a sheet, now pages that swap in for the main controls.
 enum SettingsSection: String, CaseIterable, Identifiable {
-	case map, cells, tone, ink, wave, more
+	case map, cells, tone, ink, wave, depth, more
 
 	var id: Self { self }
 
@@ -14,6 +14,7 @@ enum SettingsSection: String, CaseIterable, Identifiable {
 			case .tone: "TONE"
 			case .ink: "INK"
 			case .wave: "WAVE"
+			case .depth: "DEPTH"
 			case .more: "MORE"
 		}
 	}
@@ -25,13 +26,20 @@ enum SettingsSection: String, CaseIterable, Identifiable {
 			case .tone: .contrast
 			case .ink: .drop
 			case .wave: .wave
+			case .depth: .lidar
 			case .more: .more
 		}
 	}
 
-	/// The wave only exists with the camera off
-	static func available(usesCamera: Bool) -> [SettingsSection] {
-		allCases.filter { usesCamera ? $0 != .wave : true }
+	/// The wave's page only with DITHER, the depth range only with LIDAR
+	static func available(source: CameraSettings.Source) -> [SettingsSection] {
+		allCases.filter { section in
+			switch section {
+				case .wave: source == .wave
+				case .depth: source == .depth
+				default: true
+			}
+		}
 	}
 }
 
@@ -77,6 +85,7 @@ struct SectionPage: View {
 				case .tone: tone
 				case .ink: InkPage(configuration: $model.configuration)
 				case .wave: wave
+				case .depth: depth
 				case .more: MorePage(model: model)
 			}
 		}
@@ -119,6 +128,30 @@ struct SectionPage: View {
 			ValueTrack(title: "LEVELS", values: Steps.from(2, through: 16, by: 1), value: $model.configuration.colorNum, format: { "\(Int($0))" })
 				.disabled(model.camera.mapping == .exact)
 				.opacity(model.camera.mapping == .exact ? 0.4 : 1)
+		}
+	}
+
+	private var depth: some View {
+		Group {
+			ValueTrack(title: "NEAR", values: CameraSettings.depthNearSteps, value: Binding {
+				model.camera.depthNear
+			} set: { near in
+				// Far moves out of the way when near passes it
+				var camera = model.camera
+				camera.depthNear = near
+				if camera.depthFar < near * 1.5 {
+					camera.depthFar = CameraSettings.depthFarSteps.first { $0 >= near * 1.5 } ?? CameraSettings.depthFarSteps.last ?? 5
+				}
+				model.camera = camera
+			}, format: Steps.metres)
+			ValueTrack(
+				title: "FAR",
+				// Always past near, so the tones have room
+				values: CameraSettings.depthFarSteps.filter { $0 >= model.camera.depthNear * 1.5 },
+				value: $model.camera.depthFar,
+				format: Steps.metres
+			)
+			PixelNote(text: "NEAR IS BRIGHT, FAR IS DARK")
 		}
 	}
 
@@ -424,6 +457,10 @@ enum Steps {
 
 	static func signed(_ value: Float) -> String {
 		(value > 0.0001 ? "+" : "") + decimal(value)
+	}
+
+	static func metres(_ value: Float) -> String {
+		decimal(value) + " M"
 	}
 
 	/// Two places at most, no trailing zeros

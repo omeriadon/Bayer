@@ -46,9 +46,9 @@ struct CameraRenderingChecks {
 		for n in [2, 3, 4, 5, 6, 7] {
 			add("fov-n\(n)") { c, s in palette("1-BIT").apply(to: &c); c.gap = 0; c.cornerRadius = 0; s.texelsPerCell = n }
 		}
-		add("10-wave-pocket") { _, s in s.usesCamera = false }
-		add("11-wave-blueprint-px10") { c, s in palette("BLUEPRINT").apply(to: &c); c.pixelSize = 10; s.usesCamera = false }
-		add("12-wave-thermal-scale3") { c, s in palette("THERMAL").apply(to: &c); c.scale = 3; c.ditherMode = 1; s.usesCamera = false }
+		add("10-wave-pocket") { _, s in s.source = .wave }
+		add("11-wave-blueprint-px10") { c, s in palette("BLUEPRINT").apply(to: &c); c.pixelSize = 10; s.source = .wave }
+		add("12-wave-thermal-scale3") { c, s in palette("THERMAL").apply(to: &c); c.scale = 3; c.ditherMode = 1; s.source = .wave }
 
 		// iPhone-ish portrait at 1x points * 3 scale
 		let width = 1179, height = 2556

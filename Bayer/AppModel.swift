@@ -29,23 +29,28 @@ final class AppModel {
 		}
 	}
 
-	var camera = Defaults[.camera] {
+	var camera = AppModel.savedCamera() {
 		didSet {
 			Defaults[.camera] = camera
 			syncCameraControl()
-			if camera.usesCamera != oldValue.usesCamera {
-				if camera.usesCamera, section == .wave {
-					section = nil
+			if camera.depthRange != oldValue.depthRange {
+				controller.setDepthRange(camera.depthRange)
+			}
+			if camera.source != oldValue.source {
+				// WAVE and DEPTH pages belong to their own sources
+				if let section, !SettingsSection.available(source: camera.source).contains(section) {
+					self.section = nil
 				}
 				if camera.usesCamera {
+					// Camera to LiDAR or back swaps the session's input; from the wave it starts it
 					Task { await startCamera() }
 				} else {
 					// Fully disconnected: the session stops and its last frame goes
 					stopCamera()
 					controller.frames.clear()
 				}
-			} else if camera.usesFrontCamera != oldValue.usesFrontCamera, status == .running {
-				controller.start(front: camera.usesFrontCamera, zoom: camera.zoom)
+			} else if camera.usesFrontCamera != oldValue.usesFrontCamera, camera.source == .camera, status == .running {
+				controller.start(front: camera.usesFrontCamera, depth: false, zoom: camera.zoom)
 			}
 		}
 	}
@@ -60,6 +65,9 @@ final class AppModel {
 			}
 		}
 	}
+
+	/// Full screen: every control hidden, just the picture. A tap anywhere brings them back.
+	var controlsHidden = false
 
 	/// The open section, which takes the main controls' place
 	var section: SettingsSection?
@@ -84,7 +92,22 @@ final class AppModel {
 	)
 	let waveClock = WaveClock()
 
+	/// Settings restored onto a device without a scanner fall back to the camera
+	private static func savedCamera() -> CameraSettings {
+		var camera = Defaults[.camera]
+		if !sources.contains(camera.source) {
+			camera.source = .camera
+		}
+		return camera
+	}
+
+	/// The top-left button's stops, in order. LiDAR only where there's a scanner.
+	static let sources: [CameraSettings.Source] = CameraSettings.Source.allCases.filter {
+		$0 != .depth || CameraController.supportsLiDAR
+	}
+
 	init() {
+		controller.setDepthRange(camera.depthRange)
 		let ranges = controller.zoomRanges
 		Task { [weak self] in
 			for await range in ranges {
@@ -107,7 +130,7 @@ final class AppModel {
 	private func apply(_ event: CameraControlEvent) {
 		switch event {
 			case let .zoom(zoom): camera.zoom = zoom
-			case let .texels(texels): camera.texelsPerCell = texels
+			case let .texels(texels): camera.cellTexels = texels
 			case let .dither(dither): configuration.ditherStrength = dither
 			case let .style(index): patternIndex = index
 			case let .palette(index):
@@ -121,7 +144,7 @@ final class AppModel {
 	/// Keeps Camera Control's sliders where the app's are
 	private func syncCameraControl() {
 		controller.syncControls(CameraControlValues(
-			texels: camera.texelsPerCell,
+			texels: camera.cellTexels,
 			dither: configuration.ditherStrength,
 			style: patternIndex,
 			palette: palette.flatMap { current in DitherPalette.all.firstIndex(of: current) }
@@ -136,7 +159,7 @@ final class AppModel {
 		}
 		if await CameraController.requestAccess() {
 			status = .running
-			controller.start(front: camera.usesFrontCamera, zoom: camera.zoom)
+			controller.start(front: camera.usesFrontCamera, depth: camera.source == .depth, zoom: camera.zoom)
 		} else {
 			status = .denied
 		}
@@ -146,7 +169,17 @@ final class AppModel {
 		controller.stop()
 	}
 
+	/// Camera, then the dither wave, then LiDAR where there is one, then round again
+	func nextSource() {
+		let sources = Self.sources
+		let index = sources.firstIndex(of: camera.source) ?? 0
+		camera.source = sources[(index + 1) % sources.count]
+	}
+
 	func flipCamera() {
+		guard camera.source == .camera else {
+			return
+		}
 		// Each camera starts at its own 1×
 		camera.zoom = 1
 		camera.usesFrontCamera.toggle()
@@ -179,19 +212,24 @@ final class AppModel {
 	/// The same snap points for camera pixels per cell and, with the camera off, points per cell
 	var sizeIndex: Int {
 		get {
-			let current = camera.usesCamera ? camera.texelsPerCell : Int(configuration.pixelSize.rounded())
-			let steps = CameraSettings.texelSteps
+			let current = camera.usesCamera ? camera.cellTexels : Int(configuration.pixelSize.rounded())
+			let steps = sizeSteps
 			return steps.indices.min { abs(steps[$0] - current) < abs(steps[$1] - current) } ?? 0
 		}
 		set {
-			let steps = CameraSettings.texelSteps
+			let steps = sizeSteps
 			let value = steps[min(max(newValue, 0), steps.count - 1)]
 			if camera.usesCamera {
-				camera.texelsPerCell = value
+				camera.cellTexels = value
 			} else {
 				configuration.pixelSize = Float(value)
 			}
 		}
+	}
+
+	/// LiDAR has its own shorter list; the camera and the wave share the full one
+	var sizeSteps: [Int] {
+		CameraSettings.texelSteps(for: camera.source)
 	}
 
 	static let strengthSteps = 20

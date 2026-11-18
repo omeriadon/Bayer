@@ -21,26 +21,84 @@ nonisolated struct CameraSettings: Equatable, Sendable, Codable {
 		}
 	}
 
+	/// What the picture is made from. The top-left button steps through these.
+	enum Source: Int, CaseIterable, Codable, Sendable {
+		/// The camera's colour image
+		case camera = 0
+		/// No camera at all: Ergo's wave field, for wallpapers
+		case wave = 1
+		/// The LiDAR scanner's depth, near bright and far dark. Only on devices that have one.
+		case depth = 2
+
+		var title: String {
+			switch self {
+				case .camera: "CAM"
+				case .wave: "DITHER"
+				case .depth: "LIDAR"
+			}
+		}
+	}
+
 	var mapping = Mapping.exact
 	var invert = false
 	var usesFrontCamera = false
-	/// Off disconnects the camera completely; the picture is Ergo's wave field instead
-	var usesCamera = true
+	var source = Source.camera
 	/// As people say it: 0.5×, 1×, 2×. The lens does it on iPhone and iPad, the shader on the Mac.
 	var zoom = 1.0
 	/// Camera pixels along one side of a cell: 1 is 1:1, 2 is 1:4, 3 is 1:9.
 	/// Every cell is the exact average of its own block, so cells always land on camera pixels.
 	var texelsPerCell = 10
+	/// The same for LiDAR, kept apart because its depth map is only a few hundred pixels across
+	var depthTexelsPerCell = 2
+	/// LiDAR's tone range in metres: `depthNear` and closer is the brightest colour, `depthFar` and beyond the darkest
+	var depthNear: Float = 0.25
+	var depthFar: Float = 5
 
+	static let depthNearSteps: [Float] = [0.1, 0.2, 0.25, 0.3, 0.4, 0.5, 0.75, 1, 1.5, 2, 3]
+	/// The scanner reads to about 5 m
+	static let depthFarSteps: [Float] = [0.5, 0.75, 1, 1.5, 2, 2.5, 3, 4, 5]
+
+	/// Near and far, kept apart so the tones never collapse into one colour
+	var depthRange: ClosedRange<Float> {
+		let near = min(max(depthNear.isFinite ? depthNear : 0.25, 0.05), 4)
+		let far = min(max(depthFar.isFinite ? depthFar : 5, near * 1.5), 8)
+		return near ... far
+	}
+
+	/// The cell size for whatever's showing now
+	var cellTexels: Int {
+		get { source == .depth ? depthTexelsPerCell : texelsPerCell }
+		set {
+			if source == .depth {
+				depthTexelsPerCell = newValue
+			} else {
+				texelsPerCell = newValue
+			}
+		}
+	}
+
+	/// A capture session is feeding frames: the camera, or the LiDAR scanner. False for the wave,
+	/// which fully disconnects the camera.
+	var usesCamera: Bool {
+		source != .wave
+	}
+
+	init() {}
 	static let texelRange = 1 ... 32
 	/// Every size up close, then fewer as cells get big
 	static let texelSteps = [1, 2, 3, 4, 5, 6, 7, 8, 10, 12, 14, 16, 20, 24, 32]
+	/// LiDAR's map is small, so past 8 there'd only be a handful of cells
+	static let depthTexelSteps = [1, 2, 3, 4, 5, 6, 8]
+
+	static func texelSteps(for source: Source) -> [Int] {
+		source == .depth ? depthTexelSteps : texelSteps
+	}
 
 	/// The next snap point up or down from the current size.
 	func texels(stepping step: Int) -> Int {
-		let steps = Self.texelSteps
-		let index = steps.firstIndex { $0 >= texelsPerCell } ?? steps.count - 1
-		let current = steps[index] == texelsPerCell ? index : (step > 0 ? index - 1 : index)
+		let steps = Self.texelSteps(for: source)
+		let index = steps.firstIndex { $0 >= cellTexels } ?? steps.count - 1
+		let current = steps[index] == cellTexels ? index : (step > 0 ? index - 1 : index)
 		return steps[min(steps.count - 1, max(0, current + step))]
 	}
 
@@ -48,12 +106,53 @@ nonisolated struct CameraSettings: Equatable, Sendable, Codable {
 		var value = self
 		value.zoom = min(max(zoom.isFinite ? zoom : 1, 0.5), 10)
 		value.texelsPerCell = min(max(texelsPerCell, Self.texelRange.lowerBound), Self.texelRange.upperBound)
+		value.depthTexelsPerCell = min(max(depthTexelsPerCell, 1), Self.depthTexelSteps.last ?? 8)
 		return value
 	}
 
 	/// "1:4" for two camera pixels a side
 	var ratioTitle: String {
-		"1:\(texelsPerCell * texelsPerCell)"
+		"1:\(cellTexels * cellTexels)"
+	}
+
+	// MARK: Saved settings
+
+	private enum CodingKeys: String, CodingKey {
+		case mapping, invert, usesFrontCamera, source, zoom, texelsPerCell, depthTexelsPerCell, depthNear, depthFar
+		/// Before LiDAR, the camera was just on or off
+		case usesCamera
+	}
+
+	/// Every field is optional, so settings saved by an older Bayer still load instead of resetting
+	init(from decoder: any Decoder) throws {
+		let container = try decoder.container(keyedBy: CodingKeys.self)
+		let defaults = CameraSettings()
+		mapping = try container.decodeIfPresent(Mapping.self, forKey: .mapping) ?? defaults.mapping
+		invert = try container.decodeIfPresent(Bool.self, forKey: .invert) ?? defaults.invert
+		usesFrontCamera = try container.decodeIfPresent(Bool.self, forKey: .usesFrontCamera) ?? defaults.usesFrontCamera
+		zoom = try container.decodeIfPresent(Double.self, forKey: .zoom) ?? defaults.zoom
+		texelsPerCell = try container.decodeIfPresent(Int.self, forKey: .texelsPerCell) ?? defaults.texelsPerCell
+		depthTexelsPerCell = try container.decodeIfPresent(Int.self, forKey: .depthTexelsPerCell) ?? defaults.depthTexelsPerCell
+		depthNear = try container.decodeIfPresent(Float.self, forKey: .depthNear) ?? defaults.depthNear
+		depthFar = try container.decodeIfPresent(Float.self, forKey: .depthFar) ?? defaults.depthFar
+		if let source = try container.decodeIfPresent(Source.self, forKey: .source) {
+			self.source = source
+		} else if let usesCamera = try container.decodeIfPresent(Bool.self, forKey: .usesCamera) {
+			source = usesCamera ? .camera : .wave
+		}
+	}
+
+	func encode(to encoder: any Encoder) throws {
+		var container = encoder.container(keyedBy: CodingKeys.self)
+		try container.encode(mapping, forKey: .mapping)
+		try container.encode(invert, forKey: .invert)
+		try container.encode(usesFrontCamera, forKey: .usesFrontCamera)
+		try container.encode(source, forKey: .source)
+		try container.encode(zoom, forKey: .zoom)
+		try container.encode(texelsPerCell, forKey: .texelsPerCell)
+		try container.encode(depthTexelsPerCell, forKey: .depthTexelsPerCell)
+		try container.encode(depthNear, forKey: .depthNear)
+		try container.encode(depthFar, forKey: .depthFar)
 	}
 }
 
@@ -106,7 +205,7 @@ nonisolated struct CameraFrameInput {
 			scale.x = gridAspect / cameraAspect
 		}
 		let bounded = settings.bounded()
-		let texels = waveOnly ? 0 : bounded.texelsPerCell
+		let texels = waveOnly ? 0 : bounded.cellTexels
 		// Centre the grid's block of camera pixels in the frame
 		let crop = SIMD2<Int32>(Int32(columns * texels), Int32(rows * texels))
 		let size = SIMD2<Int32>(Int32(texture.width), Int32(texture.height))
@@ -137,6 +236,6 @@ nonisolated struct CameraFrameInput {
 		#else
 			let zoom: Float = 1
 		#endif
-		return max(1, fill * zoom * Float(bounded.texelsPerCell))
+		return max(1, fill * zoom * Float(bounded.cellTexels))
 	}
 }

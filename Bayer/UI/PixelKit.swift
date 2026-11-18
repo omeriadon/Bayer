@@ -40,7 +40,7 @@ extension EnvironmentValues {
 
 /// 9×9 pixel icons.
 enum PixelIcon: String {
-	case flip, bug, close, minus, plus, grid, pattern, camera, check, photo, tune, levels, contrast, drop, wave, more
+	case flip, bug, close, minus, plus, grid, pattern, camera, check, photo, tune, levels, contrast, drop, wave, more, lidar, expand
 
 	var rows: [String] {
 		switch self {
@@ -197,6 +197,30 @@ enum PixelIcon: String {
 					"#..#.#..#",
 					"....#....",
 					".........",
+				]
+			// Four corners pointing out: full screen
+			case .expand: [
+					"###...###",
+					"##.....##",
+					"#.#...#.#",
+					".........",
+					".........",
+					".........",
+					"#.#...#.#",
+					"##.....##",
+					"###...###",
+				]
+			// The scanner's dot grid, thinning towards the edges like a projected pattern
+			case .lidar: [
+					"#...#...#",
+					".........",
+					"..#.#.#..",
+					".........",
+					"#.#.#.#.#",
+					".........",
+					"..#.#.#..",
+					".........",
+					"#...#...#",
 				]
 			case .more: [
 					".........",
@@ -423,8 +447,15 @@ struct PixelDissolve: ViewModifier, Animatable {
 		set { amount = newValue }
 	}
 
+	/// Gone entirely once fully shown, not just disabled. A shader can't draw a scroll view through it, so
+	/// leaving it in place blanked the palette strip, which sits inside the dissolving controls.
+	@ViewBuilder
 	func body(content: Content) -> some View {
-		content.colorEffect(ShaderLibrary.pixelDissolve(.float(amount), .float(cell)))
+		if amount < 1 {
+			content.colorEffect(ShaderLibrary.pixelDissolve(.float(amount), .float(cell)))
+		} else {
+			content
+		}
 	}
 }
 

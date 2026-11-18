@@ -52,7 +52,22 @@ struct CameraScreen: View {
 				Color.clear
 					.contentShape(Rectangle())
 					.ignoresSafeArea()
-					.gesture(pinch, isEnabled: model.camera.usesCamera && model.zoomRange.maximum > model.zoomRange.minimum)
+					.gesture(pinch, isEnabled: model.camera.source == .camera && model.zoomRange.maximum > model.zoomRange.minimum)
+					// In full screen, a tap anywhere brings the controls back
+					.onTapGesture {
+						if model.controlsHidden {
+							model.controlsHidden = false
+						}
+					}
+					.accessibilityAction(named: "Show controls") {
+						model.controlsHidden = false
+					}
+					// Camera Control and the volume buttons. On this full-screen layer, behind everything, rather than
+					// the whole screen: wrapping the screen in it seemed to stop touches outside the safe area, which
+					// cut off the buttons beside the Dynamic Island.
+					.modifier(HardwareShutter {
+						model.capture(viewSize: previewSize, scale: displayScale)
+					})
 
 				if model.status == .denied, model.camera.usesCamera {
 					deniedView
@@ -69,12 +84,10 @@ struct CameraScreen: View {
 						Task { await model.finishOnboarding() }
 					}
 					.transition(.pixelDissolve)
-				} else if besideCutout {
-					cutoutButtons
 				}
 
-				if !model.hasOnboarded {
-					// The welcome has the screen to itself
+				if !model.hasOnboarded || model.controlsHidden {
+					// The welcome has the screen to itself, and full screen is just the picture
 				} else if column {
 					HStack(spacing: 0) {
 						Spacer(minLength: 0)
@@ -97,11 +110,19 @@ struct CameraScreen: View {
 					}
 					.padding(.horizontal, 14)
 				}
+
+				// Last, so nothing else in the stack sits over them
+				if model.hasOnboarded, besideCutout, !model.controlsHidden {
+					cutoutButtons
+						.transition(.pixelDissolve)
+				}
 			}
 			.animation(.easeInOut(duration: 0.3), value: model.toast)
 			.animation(.easeInOut(duration: 0.28), value: model.section)
 			.animation(.easeInOut(duration: 0.28), value: model.settingsOpen)
 			.animation(.easeInOut(duration: 0.35), value: model.hasOnboarded)
+			.animation(.easeInOut(duration: 0.28), value: model.controlsHidden)
+			.sensoryFeedback(.impact(weight: .heavy, intensity: 1), trigger: model.controlsHidden)
 			.onChange(of: landscape, initial: true) { _, landscape in
 				model.controller.setInterfaceIsPortrait(!landscape)
 			}
@@ -133,16 +154,13 @@ struct CameraScreen: View {
 				case nil: nil
 			}
 		}
-		.modifier(HardwareShutter {
-			model.capture(viewSize: previewSize, scale: displayScale)
-		})
 	}
 
 	/// The welcome shows the wave behind it, since the camera isn't asked for until the end
 	private var shownCamera: CameraSettings {
 		var camera = model.camera
 		if !model.hasOnboarded {
-			camera.usesCamera = false
+			camera.source = .wave
 		}
 		return camera
 	}
@@ -162,9 +180,12 @@ struct CameraScreen: View {
 	// MARK: Top
 
 	private var cameraButton: some View {
-		TopButton(icon: .camera, title: "CAM", lit: model.camera.usesCamera, label: model.camera.usesCamera ? "Turn camera off" : "Turn camera on") {
-			model.camera.usesCamera.toggle()
+		let source = model.camera.source
+		return TopButton(icon: source.icon, title: source.title, lit: false, label: "Picture source") {
+			model.nextSource()
 		}
+		.accessibilityValue(source.accessibilityName)
+		.accessibilityHint(AppModel.sources.count > 2 ? "Switches between camera, dither and LiDAR" : "Switches between camera and dither")
 	}
 
 	private var settingsButton: some View {
@@ -177,10 +198,12 @@ struct CameraScreen: View {
 	@ViewBuilder
 	private var cutoutButtons: some View {
 		#if canImport(NotchMyProblem)
+			// Each button floats over an empty, equally flexible side, so CAM changing width
+			// (CAM, DITHER, LIDAR) can't push TUNE along
 			CutoutAccessoryView(padding: .auto) {
-				cameraButton
+				Color.clear.overlay { cameraButton.fixedSize() }
 			} trailingContent: {
-				settingsButton
+				Color.clear.overlay { settingsButton.fixedSize() }
 			}
 		#else
 			VStack {
@@ -206,7 +229,7 @@ struct CameraScreen: View {
 		VStack(spacing: 4) {
 			VStack(spacing: spacing) {
 				if model.settingsOpen {
-					SectionBar(sections: SettingsSection.available(usesCamera: model.camera.usesCamera), selection: $model.section)
+					SectionBar(sections: SettingsSection.available(source: model.camera.source), selection: $model.section)
 						.transition(.pixelDissolve)
 				}
 				// The main controls and each section page dissolve into one another in the same place
@@ -226,25 +249,37 @@ struct CameraScreen: View {
 			.allowsHitTesting(!model.cameraControlOverlay)
 			.animation(.easeInOut(duration: 0.25), value: model.cameraControlOverlay)
 			HStack {
-				thumbnail
+				// Both sides the same width, so the shutter stays centred
+				HStack {
+					thumbnail
+					Spacer(minLength: 0)
+				}
+				.frame(width: 100)
 				Spacer()
 				PixelShutter(capturing: model.isCapturing) {
 					model.capture(viewSize: previewSize, scale: displayScale)
 				}
 				Spacer()
-				PixelIconButton(icon: .flip, label: "Switch camera") {
-					model.flipCamera()
+				HStack(spacing: 8) {
+					Spacer(minLength: 0)
+					PixelIconButton(icon: .expand, label: "Full screen") {
+						model.controlsHidden = true
+						model.show("TAP TO SHOW")
+					}
+					PixelIconButton(icon: .flip, label: "Switch camera") {
+						model.flipCamera()
+					}
+					.opacity(model.camera.source == .camera ? 1 : 0.35)
+					.disabled(model.camera.source != .camera)
 				}
-				.opacity(model.camera.usesCamera ? 1 : 0.35)
-				.disabled(!model.camera.usesCamera)
-				.frame(width: 64)
+				.frame(width: 100)
 			}
 		}
 	}
 
 	private func mainControls(spacing: CGFloat) -> some View {
 		VStack(spacing: spacing) {
-			if model.camera.usesCamera, model.zoomRange.presets.count > 1 || model.zoomRange.maximum > model.zoomRange.minimum {
+			if model.camera.source == .camera, model.zoomRange.presets.count > 1 || model.zoomRange.maximum > model.zoomRange.minimum {
 				ZoomChips(range: model.zoomRange, zoom: model.camera.zoom) {
 					model.setZoom($0, ramp: true)
 				}
@@ -259,7 +294,7 @@ struct CameraScreen: View {
 			PixelTrack(
 				title: "SIZE",
 				value: sizeTitle,
-				count: CameraSettings.texelSteps.count,
+				count: model.sizeSteps.count,
 				index: $model.sizeIndex
 			)
 			PixelTrack(
@@ -273,7 +308,7 @@ struct CameraScreen: View {
 	}
 
 	private var sizeTitle: String {
-		let step = CameraSettings.texelSteps[model.sizeIndex]
+		let step = model.sizeSteps[min(model.sizeIndex, model.sizeSteps.count - 1)]
 		return model.camera.usesCamera ? "1:\(step * step)" : "\(step) PT"
 	}
 
@@ -569,5 +604,23 @@ private struct HardwareShutter: ViewModifier {
 		#else
 			content
 		#endif
+	}
+}
+
+private extension CameraSettings.Source {
+	var icon: PixelIcon {
+		switch self {
+			case .camera: .camera
+			case .wave: .wave
+			case .depth: .lidar
+		}
+	}
+
+	var accessibilityName: String {
+		switch self {
+			case .camera: "Camera"
+			case .wave: "Dither"
+			case .depth: "LiDAR"
+		}
 	}
 }

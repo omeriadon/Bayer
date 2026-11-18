@@ -1,5 +1,8 @@
 import simd
 import SwiftUI
+#if os(iOS)
+	import UIKit
+#endif
 
 /// The settings that used to live in a sheet, now pages that swap in for the main controls.
 enum SettingsSection: String, CaseIterable, Identifiable {
@@ -123,11 +126,17 @@ struct SectionPage: View {
 
 	private var tone: some View {
 		Group {
-			ValueTrack(title: "CONTRAST", values: [0.25, 0.5, 0.75, 1, 1.25, 1.5, 1.75, 2, 2.5, 3, 4], value: $model.configuration.contrast, format: Steps.times)
+			// Shown as plus or minus, like brightness. The shader's multiplier is 2^(1.5 × that): about 0.35× to 2.8×.
+			ValueTrack(title: "CONTRAST", values: Steps.from(-1, through: 1, by: 0.1), value: Binding {
+				log2(max(model.configuration.contrast, 0.01)) / 1.5
+			} set: { offset in
+				model.configuration.contrast = abs(offset) < 0.001 ? 1 : pow(2, offset * 1.5)
+			}, format: Steps.signed)
 			ValueTrack(title: "BRIGHT", values: Steps.from(-0.5, through: 0.5, by: 0.05), value: $model.configuration.brightness, format: Steps.signed)
-			ValueTrack(title: "LEVELS", values: Steps.from(2, through: 16, by: 1), value: $model.configuration.colorNum, format: { "\(Int($0))" })
-				.disabled(model.camera.mapping == .exact)
-				.opacity(model.camera.mapping == .exact ? 0.4 : 1)
+			// Exact always uses one level per palette colour, so levels only exist for Blend and Source
+			if model.camera.mapping != .exact {
+				ValueTrack(title: "LEVELS", values: Steps.from(2, through: 16, by: 1), value: $model.configuration.colorNum, format: { "\(Int($0))" })
+			}
 		}
 	}
 
@@ -151,7 +160,6 @@ struct SectionPage: View {
 				value: $model.camera.depthFar,
 				format: Steps.metres
 			)
-			PixelNote(text: "NEAR IS BRIGHT, FAR IS DARK")
 		}
 	}
 
@@ -192,9 +200,13 @@ struct SectionPage: View {
 
 // MARK: Pages with their own state
 
-/// The palette's colours, editable, plus the colour between cells.
+/// The palette's colours, editable, plus the colour between cells. Tap a swatch, then set it with three tracks.
 private struct InkPage: View {
 	@Binding var configuration: DitherConfiguration
+
+	/// The swatch being set: a palette index, or `gapIndex` for the gap colour
+	@State private var editing: Int?
+	private static let gapIndex = -1
 
 	@Environment(\.pixelTheme) private var theme
 
@@ -202,39 +214,119 @@ private struct InkPage: View {
 		VStack(spacing: 8) {
 			HStack(spacing: 6) {
 				ForEach(configuration.palette.indices, id: \.self) { index in
-					ColorSwatch(color: paletteBinding(index), label: "Colour \(index + 1)")
+					Swatch(color: colour(index), selected: editing == index, label: "Colour \(index + 1)") {
+						editing = editing == index ? nil : index
+					}
 				}
-				Spacer(minLength: 0)
+				Spacer(minLength: 4)
+				PixelText("GAP", cell: 1.5, color: theme.mid)
+				Swatch(color: colour(Self.gapIndex), selected: editing == Self.gapIndex, label: "Gap colour") {
+					editing = editing == Self.gapIndex ? nil : Self.gapIndex
+				}
 			}
 			.pixelPanel(padding: 8)
-			HStack(spacing: 8) {
-				Button {
-					if configuration.palette.count > 2 {
-						configuration.palette.removeLast()
+
+			if let editing, editing == Self.gapIndex || configuration.palette.indices.contains(editing) {
+				let binding = colourBinding(editing)
+				VStack(spacing: 6) {
+					ForEach(Array(Self.presets.enumerated()), id: \.offset) { _, row in
+						HStack(spacing: 6) {
+							ForEach(row, id: \.self) { hex in
+								let preset = Self.colour(hex)
+								Swatch(color: preset, selected: binding.wrappedValue == preset, label: "Preset colour") {
+									binding.wrappedValue = preset
+								}
+							}
+						}
 					}
-				} label: {
-					label("LESS", icon: .minus)
 				}
-				.disabled(configuration.palette.count <= 2)
-				.opacity(configuration.palette.count <= 2 ? 0.4 : 1)
-				Button {
-					if configuration.palette.count < DitherConfiguration.supportedPaletteCount {
-						configuration.palette.append(configuration.palette.last ?? SIMD3<Float>(repeating: 1))
+				.frame(maxWidth: .infinity)
+				.pixelPanel(padding: 8)
+				HStack(spacing: 8) {
+					Button {
+						pickingSystemColour = true
+					} label: {
+						label("ANY COLOUR", icon: .drop)
 					}
-				} label: {
-					label("MORE", icon: .plus)
+					if editing != Self.gapIndex {
+						Button {
+							delete(editing)
+						} label: {
+							label("DELETE", icon: .close)
+						}
+						.disabled(configuration.palette.count <= 2)
+						.opacity(configuration.palette.count <= 2 ? 0.4 : 1)
+					}
 				}
-				.disabled(configuration.palette.count >= DitherConfiguration.supportedPaletteCount)
-				.opacity(configuration.palette.count >= DitherConfiguration.supportedPaletteCount ? 0.4 : 1)
+				.buttonStyle(PixelButtonStyle())
+				.sheet(isPresented: $pickingSystemColour) {
+					SystemColourPicker(colour: binding)
+						.presentationDetents([.medium, .large])
+				}
+			} else {
+				HStack(spacing: 8) {
+					Button {
+						if configuration.palette.count > 2 {
+							configuration.palette.removeLast()
+						}
+					} label: {
+						label("LESS", icon: .minus)
+					}
+					.disabled(configuration.palette.count <= 2)
+					.opacity(configuration.palette.count <= 2 ? 0.4 : 1)
+					Button {
+						if configuration.palette.count < DitherConfiguration.supportedPaletteCount {
+							configuration.palette.append(configuration.palette.last ?? SIMD3<Float>(repeating: 1))
+						}
+					} label: {
+						label("MORE", icon: .plus)
+					}
+					.disabled(configuration.palette.count >= DitherConfiguration.supportedPaletteCount)
+					.opacity(configuration.palette.count >= DitherConfiguration.supportedPaletteCount ? 0.4 : 1)
+				}
+				.buttonStyle(PixelButtonStyle())
 			}
-			.buttonStyle(PixelButtonStyle())
-			HStack(spacing: 10) {
-				PixelText("GAP COLOUR", cell: 2, color: theme.mid)
-				Spacer()
-				ColorSwatch(color: $configuration.backgroundColor, label: "Gap colour")
+		}
+		.animation(.snappy(duration: 0.15), value: editing)
+	}
+
+	@State private var pickingSystemColour = false
+
+	/// Neon, then blacks to white, then dim
+	private static let presets: [[UInt32]] = [
+		[0xFF2BD6, 0xFF3131, 0xFF8A00, 0xFFF01F, 0x39FF14, 0x00F0FF, 0x2D6BFF, 0xB026FF],
+		[0x000000, 0x141414, 0x2B2B2B, 0x4A4A4A, 0x767676, 0xA6A6A6, 0xD4D4D4, 0xFFFFFF],
+		[0x5A1E4C, 0x5C1F1F, 0x5E3A14, 0x55501A, 0x24501E, 0x174F55, 0x1D2F5E, 0x3B1F5E],
+	]
+
+	private static func colour(_ hex: UInt32) -> SIMD3<Float> {
+		SIMD3<Float>(Float((hex >> 16) & 0xFF) / 255, Float((hex >> 8) & 0xFF) / 255, Float(hex & 0xFF) / 255)
+	}
+
+	private func delete(_ index: Int) {
+		guard configuration.palette.count > 2, configuration.palette.indices.contains(index) else {
+			return
+		}
+		configuration.palette.remove(at: index)
+		editing = nil
+	}
+
+	private func colour(_ index: Int) -> SIMD3<Float> {
+		if index == Self.gapIndex {
+			return configuration.backgroundColor
+		}
+		return index < configuration.palette.count ? configuration.palette[index] : .zero
+	}
+
+	private func colourBinding(_ index: Int) -> Binding<SIMD3<Float>> {
+		Binding {
+			colour(index)
+		} set: { value in
+			if index == Self.gapIndex {
+				configuration.backgroundColor = value
+			} else if index < configuration.palette.count {
+				configuration.palette[index] = value
 			}
-			.pixelPanel(padding: 8)
-			PixelNote(text: "DARKEST FIRST. TAP A COLOUR TO CHANGE IT")
 		}
 	}
 
@@ -246,22 +338,103 @@ private struct InkPage: View {
 		.frame(maxWidth: .infinity)
 		.pixelPanel(padding: 10)
 	}
+}
 
-	private func paletteBinding(_ index: Int) -> Binding<SIMD3<Float>> {
-		Binding {
-			index < configuration.palette.count ? configuration.palette[index] : .zero
-		} set: { value in
-			if index < configuration.palette.count {
-				configuration.palette[index] = value
+/// The system's own colour picker, for anything the presets don't have
+private struct SystemColourPicker: View {
+	@Binding var colour: SIMD3<Float>
+
+	var body: some View {
+		#if os(iOS)
+			SystemColourPickerController(colour: $colour)
+				.ignoresSafeArea()
+		#else
+			ColorPicker("Colour", selection: Binding {
+				Color(.sRGB, red: Double(colour.x), green: Double(colour.y), blue: Double(colour.z))
+			} set: { picked in
+				if let value = SystemColourPicker.components(of: picked) {
+					colour = value
+				}
+			}, supportsOpacity: false)
+				.padding(40)
+		#endif
+	}
+
+	static func components(of colour: Color) -> SIMD3<Float>? {
+		guard let srgb = CGColorSpace(name: CGColorSpace.sRGB),
+		      let components = colour.resolve(in: EnvironmentValues()).cgColor.converted(to: srgb, intent: .defaultIntent, options: nil)?.components,
+		      components.count >= 3
+		else {
+			return nil
+		}
+		let channel = { (value: CGFloat) in Float(min(max(value, 0), 1)) }
+		return SIMD3<Float>(channel(components[0]), channel(components[1]), channel(components[2]))
+	}
+}
+
+#if os(iOS)
+	private struct SystemColourPickerController: UIViewControllerRepresentable {
+		@Binding var colour: SIMD3<Float>
+
+		func makeUIViewController(context: Context) -> UIColorPickerViewController {
+			let picker = UIColorPickerViewController()
+			picker.supportsAlpha = false
+			picker.selectedColor = UIColor(red: CGFloat(colour.x), green: CGFloat(colour.y), blue: CGFloat(colour.z), alpha: 1)
+			picker.delegate = context.coordinator
+			return picker
+		}
+
+		func updateUIViewController(_: UIColorPickerViewController, context: Context) {
+			context.coordinator.colour = $colour
+		}
+
+		func makeCoordinator() -> Coordinator {
+			Coordinator(colour: $colour)
+		}
+
+		final class Coordinator: NSObject, UIColorPickerViewControllerDelegate {
+			var colour: Binding<SIMD3<Float>>
+
+			init(colour: Binding<SIMD3<Float>>) {
+				self.colour = colour
+			}
+
+			func colorPickerViewController(_: UIColorPickerViewController, didSelect color: UIColor, continuously _: Bool) {
+				if let value = SystemColourPicker.components(of: Color(uiColor: color)) {
+					colour.wrappedValue = value
+				}
 			}
 		}
+	}
+#endif
+
+/// One colour you can tap to edit
+private struct Swatch: View {
+	let color: SIMD3<Float>
+	let selected: Bool
+	let label: String
+	let action: () -> Void
+
+	@Environment(\.pixelTheme) private var theme
+
+	var body: some View {
+		Button(action: action) {
+			PixelFrame(step: 2)
+				.fill(Color(.sRGB, red: Double(color.x), green: Double(color.y), blue: Double(color.z)))
+				.overlay { PixelFrame(step: 2).strokeBorder(selected ? theme.ink : theme.mid, lineWidth: selected ? 3 : 2) }
+				.frame(width: 30, height: 30)
+				.offset(y: selected ? -3 : 0)
+				.contentShape(Rectangle())
+		}
+		.buttonStyle(PixelButtonStyle())
+		.accessibilityLabel(label)
+		.accessibilityAddTraits(selected ? .isSelected : [])
 	}
 }
 
 private struct MorePage: View {
 	@Bindable var model: AppModel
 
-	@State private var copied = false
 	/// Reset takes a second tap, so it can't happen by accident
 	@State private var confirmingReset = false
 
@@ -269,20 +442,20 @@ private struct MorePage: View {
 
 	var body: some View {
 		VStack(spacing: 8) {
-			Button {
-				Platform.copy(SwiftExport.code(for: model.configuration.pinned(usesCamera: model.camera.usesCamera)))
-				copied = true
-				Task {
-					try? await Task.sleep(for: .seconds(1.5))
-					copied = false
+			HStack(spacing: 8) {
+				ForEach([LibrarySheet.palettes, .looks, .settings]) { sheet in
+					Button {
+						model.sheet = sheet
+					} label: {
+						VStack(spacing: 6) {
+							PixelIconView(icon: sheet.icon, cell: 2, color: theme.ink)
+							PixelText(sheet.title, cell: 1.6, color: theme.ink)
+						}
+						.frame(maxWidth: .infinity)
+						.pixelPanel(padding: 10)
+					}
+					.accessibilityLabel(sheet.title.capitalized)
 				}
-			} label: {
-				HStack(spacing: 8) {
-					PixelIconView(icon: copied ? .check : .pattern, cell: 1.6, color: copied ? theme.paper : theme.ink)
-					PixelText(copied ? "COPIED" : "COPY AS SWIFT", cell: 2, color: copied ? theme.paper : theme.ink)
-				}
-				.frame(maxWidth: .infinity)
-				.pixelPanel(lit: copied, padding: 12)
 			}
 			Button {
 				if confirmingReset {
@@ -303,10 +476,8 @@ private struct MorePage: View {
 				.frame(maxWidth: .infinity)
 				.pixelPanel(lit: confirmingReset, padding: 12)
 			}
-			PixelNote(text: "PASTE IT INTO ANOTHER PROJECT")
 		}
 		.buttonStyle(PixelButtonStyle())
-		.animation(.snappy(duration: 0.15), value: copied)
 		.animation(.snappy(duration: 0.15), value: confirmingReset)
 	}
 }
@@ -350,6 +521,7 @@ struct ToggleChip: View {
 	var body: some View {
 		Button {
 			isOn.toggle()
+			ChipSounds.shared.play(isOn ? .toggleOn : .toggleOff)
 		} label: {
 			HStack(spacing: 10) {
 				PixelText(title, cell: 2, color: isOn ? theme.paper : theme.ink)
@@ -400,46 +572,83 @@ struct PixelNote: View {
 	@Environment(\.pixelTheme) private var theme
 
 	var body: some View {
-		PixelText(text, cell: 1.3, color: theme.mid)
+		// Words wrap to the width there is, so a long note never pushes its container wider
+		PixelWords(text: text, cell: 1.3, color: theme.mid)
 			.frame(maxWidth: .infinity)
 			.pixelPanel(padding: 8)
 	}
 }
 
-/// A pixel square of colour that opens the system colour picker.
-private struct ColorSwatch: View {
-	@Binding var color: SIMD3<Float>
-	let label: String
-
-	@Environment(\.pixelTheme) private var theme
+/// Pixel text that wraps between words, centred line by line.
+struct PixelWords: View {
+	let text: String
+	var cell: CGFloat = 1.3
+	var color: Color = .white
 
 	var body: some View {
-		let swatch = Color(.sRGB, red: Double(color.x), green: Double(color.y), blue: Double(color.z))
-		PixelFrame(step: 2)
-			.fill(swatch)
-			.overlay { PixelFrame(step: 2).strokeBorder(theme.mid, lineWidth: 2) }
-			.frame(width: 30, height: 30)
-			// The system picker sits invisibly on top, slightly larger, so a tap anywhere on the swatch opens it
-			.overlay {
-				ColorPicker(label, selection: Binding {
-					swatch
-				} set: { picked in
-					guard let srgb = CGColorSpace(name: CGColorSpace.sRGB),
-					      let components = picked.resolve(in: EnvironmentValues()).cgColor.converted(to: srgb, intent: .defaultIntent, options: nil)?.components,
-					      components.count >= 3
-					else {
-						return
-					}
-					let channel = { (value: CGFloat) in Float(min(max(value, 0), 1)) }
-					color = SIMD3<Float>(channel(components[0]), channel(components[1]), channel(components[2]))
-				}, supportsOpacity: false)
-					.labelsHidden()
-					.scaleEffect(1.4)
-					.opacity(0.02)
+		WordFlow(spacing: cell * 4, lineSpacing: cell * 3) {
+			ForEach(Array(text.split(separator: " ").enumerated()), id: \.offset) { _, word in
+				PixelText(String(word), cell: cell, color: color)
 			}
-			.accessibilityElement(children: .contain)
+		}
+		.accessibilityElement(children: .ignore)
+		.accessibilityLabel(text.capitalized)
 	}
 }
+
+/// Lays words left to right, starting a new line when the next won't fit, each line centred.
+struct WordFlow: Layout {
+	var spacing: CGFloat
+	var lineSpacing: CGFloat
+
+	func sizeThatFits(proposal: ProposedViewSize, subviews: Subviews, cache _: inout ()) -> CGSize {
+		let lines = lines(for: subviews, width: proposal.width ?? .infinity)
+		let width = lines.map(\.width).max() ?? 0
+		let height = lines.map(\.height).reduce(0, +) + lineSpacing * CGFloat(max(0, lines.count - 1))
+		return CGSize(width: min(width, proposal.width ?? width), height: height)
+	}
+
+	func placeSubviews(in bounds: CGRect, proposal _: ProposedViewSize, subviews: Subviews, cache _: inout ()) {
+		var y = bounds.minY
+		for line in lines(for: subviews, width: bounds.width) {
+			var x = bounds.midX - line.width / 2
+			for index in line.indices {
+				let size = subviews[index].sizeThatFits(.unspecified)
+				subviews[index].place(at: CGPoint(x: x, y: y), proposal: ProposedViewSize(size))
+				x += size.width + spacing
+			}
+			y += line.height + lineSpacing
+		}
+	}
+
+	private struct Line {
+		var indices: [Int] = []
+		var width: CGFloat = 0
+		var height: CGFloat = 0
+	}
+
+	private func lines(for subviews: Subviews, width: CGFloat) -> [Line] {
+		var lines: [Line] = []
+		var current = Line()
+		for index in subviews.indices {
+			let size = subviews[index].sizeThatFits(.unspecified)
+			let extra = current.indices.isEmpty ? size.width : current.width + spacing + size.width
+			if !current.indices.isEmpty, extra > width {
+				lines.append(current)
+				current = Line()
+			}
+			current.width = current.indices.isEmpty ? size.width : current.width + spacing + size.width
+			current.height = max(current.height, size.height)
+			current.indices.append(index)
+		}
+		if !current.indices.isEmpty {
+			lines.append(current)
+		}
+		return lines
+	}
+}
+
+/// A pixel square of colour that opens the system colour picker.
 
 /// Value lists and how to show them.
 enum Steps {
@@ -477,80 +686,3 @@ enum Steps {
 	}
 }
 
-/// Writes a configuration in the same shape as Ergo's `detailViewConf`.
-enum SwiftExport {
-	static func code(for c: DitherConfiguration) -> String {
-		func f(_ value: Float) -> String { trim(Double(value)) }
-		func d(_ value: Double) -> String { trim(value) }
-		func trim(_ value: Double) -> String {
-			// POSIX so the decimal point is always a dot, whatever the region
-			value.formatted(.number.precision(.fractionLength(0 ... 4)).grouping(.never).locale(Locale(identifier: "en_US_POSIX")))
-		}
-		func byte(_ value: Float) -> String {
-			let text = String(Int((min(max(value, 0), 1) * 255).rounded()), radix: 16, uppercase: true)
-			return text.count == 1 ? "0" + text : text
-		}
-		func color(_ value: SIMD3<Float>, comma: Bool = false) -> String {
-			let hex = "#" + byte(value.x) + byte(value.y) + byte(value.z)
-			return "SIMD3<Float>(\(f(value.x)), \(f(value.y)), \(f(value.z)))\(comma ? "," : "") // \(hex)"
-		}
-		let palette = c.palette.map { "\t\t" + color($0, comma: true) }.joined(separator: "\n")
-		return """
-		public var bayerConf: DitherConfiguration {
-			var c = DitherConfiguration()
-
-			// Wave
-			c.waveSpeed = \(f(c.waveSpeed))
-			c.waveDirection = \(f(c.waveDirection))
-			c.waveFrequency = \(f(c.waveFrequency))
-			c.waveAmplitude = \(f(c.waveAmplitude))
-			c.scale = \(f(c.scale))
-			c.contrast = \(f(c.contrast))
-			c.brightness = \(f(c.brightness))
-
-			// Animation
-			c.disableAnimation = \(c.disableAnimation)
-			c.framesPerSecond = \(c.framesPerSecond)
-			c.intro = \(c.intro)
-
-			// Cells and dithering
-			c.pixelSize = \(f(c.pixelSize))
-			c.colorNum = \(f(c.colorNum))
-			c.ditherMode = \(c.ditherMode)
-			c.ditherStrength = \(f(c.ditherStrength))
-			c.gap = \(f(c.gap))
-			c.cornerRadius = \(f(c.cornerRadius))
-			c.joinAdjacentSquares = \(c.joinAdjacentSquares)
-
-			// Colors
-			c.waveColor = \(color(c.waveColor))
-			c.backgroundColor = \(color(c.backgroundColor))
-
-			c.palette = [
-		\(palette)
-			]
-
-			c.backgroundStyle = "\(c.backgroundStyle)"
-			c.colorPlacement = "\(c.colorPlacement)"
-			c.squareStyle = "\(c.squareStyle)"
-			c.useThemeColors = \(c.useThemeColors)
-
-			// Composition
-			c.transparent = \(c.transparent)
-			c.opacity = \(f(c.opacity))
-			c.topBlur = \(c.topBlur)
-			c.clipsToDeviceCorners = \(c.clipsToDeviceCorners)
-
-			c.cursorInteractionEnabled = \(c.cursorInteractionEnabled)
-			c.cursorRadius = \(d(c.cursorRadius))
-			c.cursorStrength = \(d(c.cursorStrength))
-			c.cursorResponse = \(d(c.cursorResponse))
-			c.cursorTrailDuration = \(d(c.cursorTrailDuration))
-			c.cursorFadeDuration = \(d(c.cursorFadeDuration))
-			c.cursorWarp = \(d(c.cursorWarp))
-
-			return c
-		}
-		"""
-	}
-}

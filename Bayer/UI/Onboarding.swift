@@ -9,17 +9,17 @@ struct Onboarding: View {
 	@Environment(\.pixelTheme) private var theme
 
 	private struct Page {
-		let icon: PixelIcon
+		/// Nil for the first page, which shows the app icon's design
+		let icon: PixelIcon?
 		let title: String
 		let body: String
 	}
 
 	private let pages = [
-		Page(icon: .camera, title: "BAYER", body: "A CAMERA THAT SEES IN DITHER. EVERY FRAME IS DRAWN IN PIXELS, LIVE."),
-		Page(icon: .grid, title: "SIZE", body: "EACH CELL IS THE EXACT AVERAGE OF A SQUARE OF CAMERA PIXELS: 1:1, 1:4, 1:9 AND UP."),
+		Page(icon: nil, title: "BAYER", body: "A CAMERA THAT SEES IN DITHER. EVERY FRAME IS DRAWN IN PIXELS, LIVE."),
 		Page(icon: .pattern, title: "STYLE AND INK", body: "PICK A PATTERN AND A PALETTE. DRAG THE DITHER TRACK TO SOFTEN IT. PINCH TO ZOOM."),
 		Page(icon: .tune, title: "TUNE", body: "TOP RIGHT. OPENS EVERYTHING ELSE: MAPPING, CELLS, TONE AND YOUR OWN COLOURS."),
-		Page(icon: .wave, title: "NO CAMERA NEEDED", body: "TAP CAM AT TOP LEFT TO SWITCH TO DITHER, A MOVING WAVE WITH NO CAMERA. GOOD FOR WALLPAPERS."),
+		Page(icon: .wave, title: "NO CAMERA NEEDED", body: "TAP CAM AT TOP LEFT FOR DITHER, A MOVING WAVE. HOLD THE SHUTTER FOR A LIVE WALLPAPER."),
 		Page(icon: .check, title: "READY", body: "BAYER NEEDS YOUR CAMERA TO SEE. PHOTOS SAVE AS CRISP PNGS, EXACTLY AS SHOWN."),
 	]
 
@@ -33,7 +33,11 @@ struct Onboarding: View {
 			ZStack {
 				let current = pages[page]
 				VStack(spacing: 16) {
-					PixelIconView(icon: current.icon, cell: 6, color: theme.ink)
+					if let icon = current.icon {
+						PixelIconView(icon: icon, cell: 6, color: theme.ink)
+					} else {
+						BayerMark(cell: 7)
+					}
 					PixelText(current.title, cell: 3.5, color: theme.ink)
 					PixelParagraph(text: current.body, cell: 2, color: theme.mid, maximumCharacters: 24)
 				}
@@ -145,5 +149,57 @@ private struct PageDots: View {
 		.animation(.snappy(duration: 0.2), value: current)
 		.accessibilityElement()
 		.accessibilityLabel("Page \(current + 1) of \(count)")
+	}
+}
+
+
+/// The app icon's design, a dithered ball, drawn cell by cell in the current palette's colours.
+struct BayerMark: View {
+	/// Points from one cell to the next
+	let cell: CGFloat
+
+	@Environment(\.pixelTheme) private var theme
+
+	/// The icon's grid: r ring, m mid tones, d highlights, g glint
+	private static let rows = [
+		".....rrrr.....",
+		"...rrddmdrr...",
+		"..rdddmdmm.r..",
+		".rdggddmdmm.r.",
+		".rdgmdmdmm.mr.",
+		"rddddmdmmmm..r",
+		"rdmdmdmmmm...r",
+		"rmdmdmmmm.m.mr",
+		"rmmmmmmm.....r",
+		".rmmmmm.m...r.",
+		".r.m.m......r.",
+		"..r.m...m..r..",
+		"...rr....rr...",
+		".....rrrr.....",
+	].map(Array.init)
+
+	var body: some View {
+		let side = cell * CGFloat(Self.rows.count)
+		Canvas { context, _ in
+			// As in the icon: each square a little smaller than its spacing, with softened corners
+			let square = cell * 0.84
+			let inset = (cell - square) / 2
+			for (y, row) in Self.rows.enumerated() {
+				for (x, mark) in row.enumerated() {
+					let color: Color
+					switch mark {
+						case "r": color = theme.mid.opacity(0.45)
+						case "m": color = theme.mid
+						case "d": color = theme.ink
+						case "g": color = .white
+						default: continue
+					}
+					let rect = CGRect(x: CGFloat(x) * cell + inset, y: CGFloat(y) * cell + inset, width: square, height: square)
+					context.fill(Path(roundedRect: rect, cornerRadius: square * 0.26), with: .color(color))
+				}
+			}
+		}
+		.frame(width: side, height: side)
+		.accessibilityHidden(true)
 	}
 }

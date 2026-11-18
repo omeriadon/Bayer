@@ -93,6 +93,7 @@
         "INFOPLIST_KEY_LSApplicationCategoryType": "public.app-category.photography",
         "INFOPLIST_KEY_NSCameraUsageDescription": "Bayer dithers what your camera sees, live.",
         "INFOPLIST_KEY_NSPhotoLibraryAddUsageDescription": "Bayer saves your dithered photos to your library.",
+        "INFOPLIST_KEY_NSPhotoLibraryUsageDescription": "Bayer opens your photos to dither them, and opens the photos it saved so you can change their dither.",
         "INFOPLIST_KEY_UIApplicationSceneManifest_Generation": "YES",
         "INFOPLIST_KEY_UIApplicationSupportsIndirectInputEvents": "YES",
         "INFOPLIST_KEY_UILaunchScreen_Generation": "YES",

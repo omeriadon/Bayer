@@ -950,6 +950,17 @@ kernel void ditherCameraCellCompute(
     float value = shapedValue(mix(wave, luminance, cameraUniforms.cameraMix), uv, cursor, fieldUniforms);
     float2 cell = floor(position);
 
+    // 8 and 9 are error diffusion, which can't be decided one cell at a time. Store the shaped colour
+    // and value; ditherDiffuseCompute quantizes the whole grid afterwards.
+    if (ditherUniforms.mode >= 8) {
+        float3 shapedColour = float3(
+            shapedValue(mix(wave, rgb.r, cameraUniforms.cameraMix), uv, cursor, fieldUniforms),
+            shapedValue(mix(wave, rgb.g, cameraUniforms.cameraMix), uv, cursor, fieldUniforms),
+            shapedValue(mix(wave, rgb.b, cameraUniforms.cameraMix), uv, cursor, fieldUniforms));
+        output.write(float4(shapedColour, value), gid);
+        return;
+    }
+
     // 0: Ergo's own mapping, identical to the wave renderer.
     if (cameraUniforms.mapping == 0 || (ditherUniforms.useThemeColors > 0 && ditherUniforms.themeCount > 0)) {
         output.write(quantizedCellColor(quantizedFieldValue(value), cell, ditherUniforms, palette, themePositions, themeColors), gid);
@@ -1054,4 +1065,109 @@ fragment float4 ditherUpscaleFractional(
         }
     }
     return float4(mix(uniforms.background, cellColor.rgb, shape), 1.0);
+}
+
+// MARK: - Error diffusion (Atkinson, Floyd-Steinberg)
+//
+// ditherCameraCellCompute leaves each cell's shaped colour (rgb) and value (a) for modes 8 and 9.
+// This kernel then quantizes the grid as a wavefront in one threadgroup: one thread per row, each
+// two cells behind the row above, so every error a cell receives has landed before it's read.
+// Errors for the next rows live in a three-row ring that each cell clears as it reads.
+// Rows past the threadgroup's size go in further passes, which carry on from the same ring.
+
+kernel void ditherDiffuseCompute(
+    texture2d<float, access::read_write> cells [[texture(0)]],
+    constant DitherUniforms &uniforms [[buffer(0)]],
+    constant float3 *palette [[buffer(1)]],
+    constant CameraUniforms &cameraUniforms [[buffer(2)]],
+    device float4 *errors [[buffer(3)]],
+    uint laneIndex [[thread_position_in_threadgroup]],
+    uint threadCount [[threads_per_threadgroup]]) {
+    int width = uniforms.fieldSize.x;
+    int height = uniforms.fieldSize.y;
+    int lane = int(laneIndex);
+    int lanes = int(threadCount);
+    for (int i = lane; i < width * 3; i += lanes) {
+        errors[i] = float4(0.0);
+    }
+    threadgroup_barrier(mem_flags::mem_device);
+
+    bool atkinson = uniforms.mode == 8;
+    float strength = uniforms.ditherStrength;
+    float count = float(max(uniforms.paletteCount, 1));
+    float levels = max(uniforms.colorNum, 2.0) - 1.0;
+    int mapping = cameraUniforms.mapping;
+
+    for (int base = 0; base < height; base += lanes) {
+        int y = base + lane;
+        bool active = y < height;
+        int rowsThisPass = min(lanes, height - base);
+        int steps = width + 2 * (rowsThisPass - 1);
+        float4 ahead1 = float4(0.0);
+        float4 ahead2 = float4(0.0);
+        for (int step = 0; step < steps; step++) {
+            int x = step - 2 * lane;
+            if (active && x >= 0 && x < width) {
+                int slot = (y % 3) * width + x;
+                float4 incoming = errors[slot];
+                errors[slot] = float4(0.0);
+                float4 v = clamp(cells.read(uint2(x, y)) + incoming + ahead1, -1.0, 2.0);
+                ahead1 = ahead2;
+                ahead2 = float4(0.0);
+
+                float4 q = v;
+                float3 color;
+                float alpha;
+                if (mapping == 2) {
+                    // Source colour: each channel to colorNum levels
+                    float3 c = clamp(floor(clamp(v.rgb, 0.0, 1.0) * levels + 0.5) / levels, 0.0, 1.0);
+                    q.rgb = c;
+                    color = c;
+                    alpha = max(c.r, max(c.g, c.b)) > 0.0 ? 1.0 : 0.0;
+                } else if (mapping == 1 && uniforms.paletteCount > 1) {
+                    // Exact: one palette colour per cell, darkest first
+                    float index = clamp(floor(clamp(v.a, 0.0, 1.0) * (count - 1.0) + 0.5), 0.0, count - 1.0);
+                    q.a = index / (count - 1.0);
+                    color = palette[int(index)];
+                    alpha = index > 0.0 ? 1.0 : 0.0;
+                } else {
+                    // Blend: a palette colour, shown over the gap colour as strongly as the level says
+                    float level = clamp(floor(clamp(v.a, 0.0, 1.0) * levels + 0.5) / levels, 0.0, 1.0);
+                    q.a = level;
+                    float3 ink = uniforms.paletteCount > 1
+                        ? palette[int(clamp(floor(clamp(v.a, 0.0, 1.0) * (count - 1.0) + 0.5), 0.0, count - 1.0))]
+                        : uniforms.wave;
+                    color = mix(uniforms.background, ink, level);
+                    alpha = level > 0.0 ? 1.0 : 0.0;
+                }
+
+                float4 error = (v - q) * strength;
+                int below = ((y + 1) % 3) * width;
+                bool hasBelow = y + 1 < height;
+                if (atkinson) {
+                    // Six neighbours get an eighth each; a quarter of the error is dropped, which keeps contrast
+                    float4 share = error / 8.0;
+                    ahead1 += share;
+                    ahead2 += share;
+                    if (hasBelow) {
+                        if (x > 0) errors[below + x - 1] += share;
+                        errors[below + x] += share;
+                        if (x + 1 < width) errors[below + x + 1] += share;
+                    }
+                    if (y + 2 < height) {
+                        errors[((y + 2) % 3) * width + x] += share;
+                    }
+                } else {
+                    ahead1 += error * (7.0 / 16.0);
+                    if (hasBelow) {
+                        if (x > 0) errors[below + x - 1] += error * (3.0 / 16.0);
+                        errors[below + x] += error * (5.0 / 16.0);
+                        if (x + 1 < width) errors[below + x + 1] += error * (1.0 / 16.0);
+                    }
+                }
+                cells.write(float4(color, alpha), uint2(x, y));
+            }
+            threadgroup_barrier(mem_flags::mem_device);
+        }
+    }
 }

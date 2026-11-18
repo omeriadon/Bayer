@@ -1,3 +1,4 @@
+import PhotosUI
 import SwiftUI
 #if canImport(NotchMyProblem)
 	import NotchMyProblem
@@ -12,6 +13,8 @@ struct CameraScreen: View {
 	@State private var previewSize = CGSize.zero
 	/// The zoom when a pinch began
 	@State private var pinchStart: Double?
+	/// A photo or video picked to dither
+	@State private var picked: PhotosPickerItem?
 
 	@Environment(\.displayScale) private var displayScale
 	@Environment(\.scenePhase) private var scenePhase
@@ -39,41 +42,71 @@ struct CameraScreen: View {
 			ZStack {
 				theme.paper.ignoresSafeArea()
 
-				DitherCameraView(
-					configuration: model.configuration,
-					camera: shownCamera,
-					frames: model.controller.frames,
-					clock: model.waveClock
-				)
-				.ignoresSafeArea()
-				.onGeometryChange(for: CGSize.self) { $0.size } action: { previewSize = $0 }
+				if let editing = model.editing {
+					// A still shows whole, in its own shape, exactly as it will save
+					DitherCameraView(
+						configuration: model.configuration,
+						camera: shownCamera,
+						frames: model.stillFrames,
+						clock: model.waveClock,
+						isStill: true
+					)
+					.aspectRatio(CGSize(width: editing.width, height: editing.height), contentMode: .fit)
+					.frame(maxWidth: .infinity, maxHeight: .infinity)
+					// A plain fade: the preview is a Metal view, which SwiftUI can't run the dissolve shader over
+					.transition(.opacity)
+				} else {
+					DitherCameraView(
+						configuration: model.configuration,
+						camera: shownCamera,
+						frames: model.controller.frames,
+						clock: model.waveClock
+					)
+					.ignoresSafeArea()
+					.onGeometryChange(for: CGSize.self) { $0.size } action: { size in
+						previewSize = size
+						model.previewPixels = CGSize(width: size.width * displayScale, height: size.height * displayScale)
+						model.displayScale = displayScale
+					}
+				}
+
+				// Camera Control and the volume buttons, on a layer of their own under everything. Their handler
+				// seems to swallow touches on whatever view carries it, so nothing else lives here.
+				Color.clear
+					.ignoresSafeArea()
+					.modifier(HardwareShutter {
+						model.capture(viewSize: previewSize, scale: displayScale)
+					})
 
 				// Pinch anywhere on the picture to zoom
 				Color.clear
 					.contentShape(Rectangle())
 					.ignoresSafeArea()
-					.gesture(pinch, isEnabled: model.camera.source == .camera && model.zoomRange.maximum > model.zoomRange.minimum)
-					// In full screen, a tap anywhere brings the controls back
-					.onTapGesture {
-						if model.controlsHidden {
-							model.controlsHidden = false
-						}
-					}
-					.accessibilityAction(named: "Show controls") {
-						model.controlsHidden = false
-					}
-					// Camera Control and the volume buttons. On this full-screen layer, behind everything, rather than
-					// the whole screen: wrapping the screen in it seemed to stop touches outside the safe area, which
-					// cut off the buttons beside the Dynamic Island.
-					.modifier(HardwareShutter {
-						model.capture(viewSize: previewSize, scale: displayScale)
-					})
+					.gesture(pinch, isEnabled: model.usesLens && model.zoomRange.maximum > model.zoomRange.minimum)
 
 				if model.status == .denied, model.camera.usesCamera {
 					deniedView
 				}
 
-				if let toast = model.toast {
+				if let progress = model.videoProgress {
+					// A video being dithered: how far along, and a way to stop
+					VStack(spacing: 10) {
+						PixelText("VIDEO \(Int((progress * 100).rounded()))%", cell: 3, color: theme.ink)
+						PixelTrack(title: "", value: "", count: 20, index: .constant(Int(progress * 19)), titleWidth: 0, valueWidth: 0)
+							.allowsHitTesting(false)
+						Button {
+							model.cancelVideo()
+						} label: {
+							PixelText("STOP", cell: 2, color: theme.ink)
+								.frame(maxWidth: .infinity)
+								.pixelPanel(padding: 10)
+						}
+						.buttonStyle(PixelButtonStyle())
+					}
+					.frame(width: 240)
+					.pixelPanel(padding: 16)
+					.transition(.pixelDissolve)
+				} else if let toast = model.toast {
 					PixelText(toast, cell: 3.5, color: theme.ink)
 						.pixelPanel(padding: 12)
 						.transition(.pixelDissolve)
@@ -116,8 +149,43 @@ struct CameraScreen: View {
 					cutoutButtons
 						.transition(.pixelDissolve)
 				}
+
+				#if DEBUG
+					if model.hasOnboarded, !model.controlsHidden {
+						// Debug builds only: bring the welcome back. Inside the safe area, under TUNE.
+						VStack {
+							HStack {
+								Spacer()
+								TopButton(icon: .bug, title: "INTRO", lit: false, label: "Show the welcome again") {
+									model.hasOnboarded = false
+								}
+							}
+							Spacer()
+						}
+						.padding(.top, besideCutout ? 6 : 52)
+						.padding(.horizontal, column ? 10 : 14)
+					}
+				#endif
+
+				if model.controlsHidden {
+					// Full screen: the whole picture is one big button back, and still pinches to zoom
+					Color.clear
+						.contentShape(Rectangle())
+						.ignoresSafeArea()
+						.onTapGesture {
+							model.controlsHidden = false
+						}
+						.gesture(pinch, isEnabled: model.usesLens && model.zoomRange.maximum > model.zoomRange.minimum)
+						.accessibilityElement()
+						.accessibilityLabel("Show controls")
+						.accessibilityAddTraits(.isButton)
+						.accessibilityAction {
+							model.controlsHidden = false
+						}
+				}
 			}
 			.animation(.easeInOut(duration: 0.3), value: model.toast)
+			.animation(.easeInOut(duration: 0.3), value: model.videoProgress == nil)
 			.animation(.easeInOut(duration: 0.28), value: model.section)
 			.animation(.easeInOut(duration: 0.28), value: model.settingsOpen)
 			.animation(.easeInOut(duration: 0.35), value: model.hasOnboarded)
@@ -130,9 +198,25 @@ struct CameraScreen: View {
 		.environment(\.pixelTheme, theme)
 		.preferredColorScheme(.dark)
 		.hidesSystemChrome()
+		.onChange(of: picked) { _, item in
+			guard let item else {
+				return
+			}
+			picked = nil
+			model.importItem(item)
+		}
+		.sheet(item: $model.sheet) { sheet in
+			LibrarySheetView(sheet: sheet, model: model)
+				.environment(\.pixelTheme, theme)
+				.presentationDetents([.medium, .large])
+				.presentationBackground(theme.paper)
+				#if os(macOS)
+					.frame(minWidth: 460, minHeight: 560)
+				#endif
+		}
 		.fullScreen(isPresented: $model.viewingPhoto) {
 			if let photo = model.lastPhoto {
-				PhotoViewer(image: photo)
+				PhotoViewer(image: photo, edit: model.lastAssetID == nil ? nil : { model.editLastPhoto() })
 					.environment(\.pixelTheme, theme)
 			}
 		}
@@ -179,9 +263,19 @@ struct CameraScreen: View {
 
 	// MARK: Top
 
+	@ViewBuilder
 	private var cameraButton: some View {
-		let source = model.camera.source
-		return TopButton(icon: source.icon, title: source.title, lit: false, label: "Picture source") {
+		if model.isEditing {
+			TopButton(icon: .close, title: "DONE", lit: true, label: "Finish editing") {
+				model.endEditing()
+			}
+		} else {
+			sourceButton(model.camera.source)
+		}
+	}
+
+	private func sourceButton(_ source: CameraSettings.Source) -> some View {
+		TopButton(icon: source.icon, title: source.title, lit: false, label: "Picture source") {
 			model.nextSource()
 		}
 		.accessibilityValue(source.accessibilityName)
@@ -250,14 +344,22 @@ struct CameraScreen: View {
 			.animation(.easeInOut(duration: 0.25), value: model.cameraControlOverlay)
 			HStack {
 				// Both sides the same width, so the shutter stays centred
-				HStack {
+				HStack(spacing: 8) {
 					thumbnail
+					let ink = PixelTheme(palette: model.configuration.palette).ink
+					PhotosPicker(selection: $picked, matching: .any(of: [.images, .videos]), photoLibrary: .shared()) {
+						ImportLabel(color: ink)
+					}
+					.buttonStyle(PixelButtonStyle())
+					.accessibilityLabel("Dither a photo or video")
 					Spacer(minLength: 0)
 				}
 				.frame(width: 100)
 				Spacer()
 				PixelShutter(capturing: model.isCapturing) {
 					model.capture(viewSize: previewSize, scale: displayScale)
+				} hold: {
+					model.capture(viewSize: previewSize, scale: displayScale, live: model.camera.source == .wave)
 				}
 				Spacer()
 				HStack(spacing: 8) {
@@ -269,8 +371,8 @@ struct CameraScreen: View {
 					PixelIconButton(icon: .flip, label: "Switch camera") {
 						model.flipCamera()
 					}
-					.opacity(model.camera.source == .camera ? 1 : 0.35)
-					.disabled(model.camera.source != .camera)
+					.opacity(model.usesLens ? 1 : 0.35)
+					.disabled(!model.usesLens)
 				}
 				.frame(width: 100)
 			}
@@ -279,7 +381,7 @@ struct CameraScreen: View {
 
 	private func mainControls(spacing: CGFloat) -> some View {
 		VStack(spacing: spacing) {
-			if model.camera.source == .camera, model.zoomRange.presets.count > 1 || model.zoomRange.maximum > model.zoomRange.minimum {
+			if model.usesLens, model.zoomRange.presets.count > 1 || model.zoomRange.maximum > model.zoomRange.minimum {
 				ZoomChips(range: model.zoomRange, zoom: model.camera.zoom) {
 					model.setZoom($0, ramp: true)
 				}
@@ -303,7 +405,11 @@ struct CameraScreen: View {
 				count: AppModel.strengthSteps + 1,
 				index: $model.strengthIndex
 			)
-			PaletteStrip(selected: model.palette) { model.select($0) }
+			PaletteStrip(palettes: model.shownPalettes, selected: model.palette) {
+				model.select($0)
+			} edit: {
+				model.sheet = .palettes
+			}
 		}
 	}
 
@@ -345,6 +451,17 @@ struct CameraScreen: View {
 			}
 			.buttonStyle(PixelButtonStyle())
 		}
+	}
+}
+
+/// The import button's face. Its own view, since PhotosPicker builds its label outside the main actor.
+private nonisolated struct ImportLabel: View {
+	let color: Color
+
+	var body: some View {
+		PixelIconView(icon: .load, cell: 2.5, color: color)
+			.frame(width: 28, height: 28)
+			.pixelPanel(padding: 6)
 	}
 }
 
@@ -398,8 +515,12 @@ private struct Thumbnail: View {
 }
 
 private struct PaletteStrip: View {
+	let palettes: [DitherPalette]
 	let selected: DitherPalette?
 	let select: (DitherPalette) -> Void
+	let edit: () -> Void
+
+	@Environment(\.pixelTheme) private var theme
 
 	/// How wide each edge fade is: it grows with the content past that edge, up to `maximumFade`
 	@State private var fades = Fades()
@@ -414,7 +535,7 @@ private struct PaletteStrip: View {
 	var body: some View {
 		ScrollView(.horizontal) {
 			HStack(spacing: 8) {
-				ForEach(DitherPalette.all) { palette in
+				ForEach(palettes) { palette in
 					Button {
 						select(palette)
 					} label: {
@@ -434,6 +555,26 @@ private struct PaletteStrip: View {
 					.accessibilityLabel(palette.name.capitalized)
 					.accessibilityAddTraits(palette == selected ? .isSelected : [])
 				}
+				// The palette sheet: hide built-ins, make your own
+				Button(action: edit) {
+					VStack(spacing: 5) {
+						PixelIconView(icon: .drop, cell: 1.6, color: theme.ink)
+						PixelText("EDIT", cell: 1.6, color: theme.ink)
+					}
+					.frame(minHeight: 29)
+					.pixelPanel(padding: 7)
+				}
+				.buttonStyle(PixelButtonStyle())
+				.visualEffect { [fades] content, proxy in
+					content.colorEffect(ShaderLibrary.pixelEdgeFade(
+						.float(proxy.frame(in: .scrollView(axis: .horizontal)).minX),
+						.float(fades.width),
+						.float(fades.leading),
+						.float(fades.trailing),
+						.float(2.5)
+					))
+				}
+				.accessibilityLabel("Edit palettes")
 			}
 			.padding(.horizontal, 2)
 			.padding(.vertical, 2)
@@ -478,6 +619,8 @@ private struct PaletteChip: View {
 /// The last photo, full screen and unsmoothed, with share and a way to Photos.
 private struct PhotoViewer: View {
 	let image: CGImage
+	/// Opens the photo again to change its dither, when it was saved with its original
+	var edit: (() -> Void)?
 
 	@Environment(\.dismiss) private var dismiss
 	@Environment(\.openURL) private var openURL
@@ -508,6 +651,14 @@ private struct PhotoViewer: View {
 						PixelText("SHARE", cell: 2.5, color: theme.paper)
 							.frame(maxWidth: .infinity)
 							.pixelPanel(lit: true, padding: 12)
+					}
+					if let edit {
+						Button(action: edit) {
+							PixelText("EDIT", cell: 2.5, color: theme.ink)
+								.frame(maxWidth: .infinity)
+								.pixelPanel(padding: 12)
+						}
+						.accessibilityLabel("Change this photo's dither")
 					}
 					Button {
 						if let url = Platform.photosURL {

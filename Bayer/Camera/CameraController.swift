@@ -12,12 +12,17 @@ nonisolated final class LatestCameraFrame: Sendable {
 		let owner: FrameOwner
 	}
 
-	/// Keeps a CVMetalTexture (and so its pixel buffer) alive. CF types aren't Sendable, but this one is never mutated.
+	/// Keeps whatever owns a frame's memory alive: a CVMetalTexture (and so its pixel buffer) for the camera,
+	/// or nothing extra for a still. CF types aren't Sendable, but these are never mutated.
 	final class FrameOwner: @unchecked Sendable {
-		let texture: CVMetalTexture
+		let object: AnyObject?
 
 		init(_ texture: CVMetalTexture) {
-			self.texture = texture
+			object = texture
+		}
+
+		init(still _: Void) {
+			object = nil
 		}
 	}
 
@@ -105,6 +110,8 @@ nonisolated final class CameraController: NSObject, AVCaptureVideoDataOutputSamp
 	private var usesDepth = false
 	private var interfaceIsPortrait = true
 	private var controlValues = CameraControlValues()
+	/// The palettes on Camera Control's picker, in the strip's order
+	private var paletteNames = DitherPalette.all.map(\.name)
 	#if os(iOS)
 		private var rotationCoordinator: AVCaptureDevice.RotationCoordinator?
 		private var rotationObservation: NSKeyValueObservation?
@@ -384,6 +391,21 @@ nonisolated final class CameraController: NSObject, AVCaptureVideoDataOutputSamp
 		}
 	#endif
 
+	/// The strip's palettes changed: Camera Control's picker is rebuilt to match.
+	func setPaletteNames(_ names: [String]) {
+		sessionQueue.async { [self] in
+			guard names != paletteNames, !names.isEmpty else {
+				return
+			}
+			paletteNames = names
+			#if os(iOS)
+				if let device = input?.device {
+					installControls(for: device, zoom: !usesDepth)
+				}
+			#endif
+		}
+	}
+
 	/// Moves Camera Control's sliders to match the app, after a change made on screen.
 	func syncControls(_ values: CameraControlValues) {
 		sessionQueue.async { [self] in
@@ -476,7 +498,7 @@ nonisolated final class CameraController: NSObject, AVCaptureVideoDataOutputSamp
 			let palette = AVCaptureIndexPicker(
 				"Palette",
 				symbolName: "paintpalette",
-				localizedIndexTitles: DitherPalette.all.map(\.name.capitalized)
+				localizedIndexTitles: paletteNames.map(\.capitalized)
 			)
 			palette.setActionQueue(sessionQueue) { index in
 				events.yield(.palette(index))

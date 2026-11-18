@@ -2,10 +2,11 @@ import Foundation
 import simd
 
 /// A palette, darkest colour first. Exact mapping depends on that order.
-nonisolated struct DitherPalette: Identifiable, Equatable, Sendable {
+/// Built-in palettes use their name as their id; your own get a `custom-` id, so names can repeat.
+nonisolated struct DitherPalette: Identifiable, Equatable, Hashable, Sendable, Codable {
 	let id: String
-	let name: String
-	let colors: [SIMD3<Float>]
+	var name: String
+	var colors: [SIMD3<Float>]
 
 	init(_ name: String, _ hex: [UInt32]) {
 		id = name
@@ -17,6 +18,21 @@ nonisolated struct DitherPalette: Identifiable, Equatable, Sendable {
 				Float(value & 0xFF) / 255
 			)
 		}
+	}
+
+	init(id: String, name: String, colors: [SIMD3<Float>]) {
+		self.id = id
+		self.name = name
+		self.colors = colors
+	}
+
+	/// One of yours, in the order you made it
+	static func custom(named name: String, colors: [SIMD3<Float>]) -> DitherPalette {
+		DitherPalette(id: "custom-\(UUID().uuidString)", name: name, colors: colors)
+	}
+
+	var isBuiltIn: Bool {
+		Self.all.contains { $0.id == id }
 	}
 
 	static let all: [DitherPalette] = [
@@ -42,8 +58,14 @@ nonisolated struct DitherPalette: Identifiable, Equatable, Sendable {
 	}
 
 	/// The palette whose colours a configuration currently uses, if any.
-	static func matching(_ configuration: DitherConfiguration) -> DitherPalette? {
-		all.first { $0.colors == configuration.palette }
+	static func matching(_ configuration: DitherConfiguration, in palettes: [DitherPalette] = all) -> DitherPalette? {
+		palettes.first { $0.colors == configuration.palette }
+	}
+}
+
+nonisolated extension [SIMD3<Float>] {
+	func sortedByLuminance() -> [SIMD3<Float>] {
+		sorted { simd_dot($0, SIMD3<Float>(0.2126, 0.7152, 0.0722)) < simd_dot($1, SIMD3<Float>(0.2126, 0.7152, 0.0722)) }
 	}
 }
 

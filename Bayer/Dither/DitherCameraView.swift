@@ -19,6 +19,8 @@ struct DitherCameraView: View {
 	let camera: CameraSettings
 	let frames: LatestCameraFrame
 	let clock: WaveClock
+	/// A photo being edited: it never moves, so it's only drawn again when something changes
+	var isStill = false
 
 	@State private var isVisible = false
 
@@ -30,7 +32,8 @@ struct DitherCameraView: View {
 			camera: camera.bounded(),
 			frames: frames,
 			clock: clock,
-			active: scenePhase == .active && isVisible
+			active: scenePhase == .active && isVisible,
+			isStill: isStill
 		)
 		.onAppear { isVisible = true }
 		.onDisappear { isVisible = false }
@@ -45,6 +48,7 @@ private struct DitherCameraPlatformView {
 	let frames: LatestCameraFrame
 	let clock: WaveClock
 	let active: Bool
+	let isStill: Bool
 
 	func makeHost() -> DitherCameraHostView {
 		let view = DitherCameraHostView(frame: .zero, device: MTLCreateSystemDefaultDevice())
@@ -53,7 +57,7 @@ private struct DitherCameraPlatformView {
 	}
 
 	func update(_ view: DitherCameraHostView) {
-		view.update(configuration: configuration, camera: camera, frames: frames, clock: clock, active: active)
+		view.update(configuration: configuration, camera: camera, frames: frames, clock: clock, active: active, isStill: isStill)
 	}
 
 	static func dismantle(_ view: DitherCameraHostView) {
@@ -99,6 +103,7 @@ private final class DitherCameraHostView: MTKView, MTKViewDelegate {
 	private var frames: LatestCameraFrame?
 	private var clock: WaveClock?
 	private var active = false
+	private var isStill = false
 	private var renderer: DitherMetalRenderer?
 	private var failed = false
 	private var frameScheduler = DitherFrameScheduler()
@@ -129,7 +134,8 @@ private final class DitherCameraHostView: MTKView, MTKViewDelegate {
 		fatalError("Use DitherCameraView()")
 	}
 
-	func update(configuration: DitherConfiguration, camera: CameraSettings, frames: LatestCameraFrame, clock: WaveClock, active: Bool) {
+	func update(configuration: DitherConfiguration, camera: CameraSettings, frames: LatestCameraFrame, clock: WaveClock, active: Bool, isStill: Bool) {
+		self.isStill = isStill
 		if self.camera.usesCamera != camera.usesCamera {
 			renderer?.seedAnimationTiming()
 		}
@@ -155,7 +161,7 @@ private final class DitherCameraHostView: MTKView, MTKViewDelegate {
 
 	/// The camera always moves. The wave only moves while animating.
 	private var isMoving: Bool {
-		camera.usesCamera || !configuration.disableAnimation
+		(camera.usesCamera && !isStill) || (!camera.usesCamera && !configuration.disableAnimation)
 	}
 
 	#if os(iOS)

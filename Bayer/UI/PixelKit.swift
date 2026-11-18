@@ -40,7 +40,7 @@ extension EnvironmentValues {
 
 /// 9×9 pixel icons.
 enum PixelIcon: String {
-	case flip, bug, close, minus, plus, grid, pattern, camera, check, photo, tune, levels, contrast, drop, wave, more, lidar, expand
+	case flip, bug, close, minus, plus, grid, pattern, camera, check, photo, tune, levels, contrast, drop, wave, more, lidar, expand, load
 
 	var rows: [String] {
 		switch self {
@@ -198,6 +198,18 @@ enum PixelIcon: String {
 					"....#....",
 					".........",
 				]
+			// A tray with an arrow coming in: bring a photo in
+			case .load: [
+					"....#....",
+					"....#....",
+					"..#.#.#..",
+					"...###...",
+					"....#....",
+					"#.......#",
+					"#.......#",
+					"#########",
+					".........",
+				]
 			// Four corners pointing out: full screen
 			case .expand: [
 					"###...###",
@@ -347,6 +359,11 @@ struct PixelButtonStyle: ButtonStyle {
 			.sensoryFeedback(trigger: configuration.isPressed) { _, pressed in
 				pressed ? .impact(weight: .heavy, intensity: 1) : .impact(flexibility: .rigid, intensity: 0.55)
 			}
+			.onChange(of: configuration.isPressed) { _, pressed in
+				if pressed {
+					ChipSounds.shared.play(.click)
+				}
+			}
 	}
 }
 
@@ -380,25 +397,36 @@ struct PixelIconButton: View {
 struct PixelShutter: View {
 	var capturing = false
 	let action: () -> Void
+	/// Pressing and holding: a Live Photo with the wave. Without it, holding just takes a photo.
+	var hold: (() -> Void)?
 
+	@State private var pressed = false
 	@Environment(\.pixelTheme) private var theme
 
 	var body: some View {
-		Button(action: action) {
-			ShutterFace(capturing: capturing, theme: theme)
-		}
-		.buttonStyle(ShutterStyle())
-		.accessibilityLabel("Take photo")
-	}
-
-	private struct ShutterStyle: ButtonStyle {
-		func makeBody(configuration: Configuration) -> some View {
-			configuration.label
-				.environment(\.shutterPressed, configuration.isPressed)
-				.sensoryFeedback(trigger: configuration.isPressed) { _, pressed in
-					pressed ? .impact(weight: .heavy, intensity: 1) : .impact(weight: .medium, intensity: 0.8)
+		ShutterFace(capturing: capturing, theme: theme)
+			.environment(\.shutterPressed, pressed)
+			.contentShape(Rectangle())
+			.onTapGesture(perform: action)
+			.onLongPressGesture(minimumDuration: 0.5) {
+				(hold ?? action)()
+			} onPressingChanged: { pressing in
+				pressed = pressing
+			}
+			.sensoryFeedback(trigger: pressed) { _, pressed in
+				pressed ? .impact(weight: .heavy, intensity: 1) : .impact(weight: .medium, intensity: 0.8)
+			}
+			.accessibilityElement()
+			.accessibilityLabel("Take photo")
+			.accessibilityAddTraits(.isButton)
+			.accessibilityAction {
+				action()
+			}
+			.accessibilityActions {
+				if let hold {
+					Button("Hold the shutter", action: hold)
 				}
-		}
+			}
 	}
 
 	private struct ShutterFace: View {
@@ -533,6 +561,9 @@ struct PixelTrack: View {
 		.padding(.vertical, 2)
 		.pixelPanel(padding: 9)
 		.sensoryFeedback(.pixelStep, trigger: index)
+		.onChange(of: index) { _, step in
+			ChipSounds.shared.play(.tick(count > 1 ? Double(step) / Double(count - 1) : 0))
+		}
 		.accessibilityElement(children: .ignore)
 		.accessibilityLabel(title.capitalized)
 		.accessibilityValue(value.capitalized)

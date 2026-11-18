@@ -10,6 +10,7 @@ xcrun swiftc -O -parse-as-library \
 	"$root/Bayer/Dither/DitherRenderer.swift" \
 	"$root/Bayer/Dither/CameraInput.swift" \
 	"$root/Bayer/Dither/Palettes.swift" \
+	"$root/Bayer/Dither/PaletteExtractor.swift" \
 	"$root/Checks/CameraRenderingChecks.swift" \
 	-o "$build/check"
 "$build/check" "$build/default.metallib" "$1" "$2"

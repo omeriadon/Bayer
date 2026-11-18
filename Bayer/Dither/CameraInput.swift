@@ -177,6 +177,8 @@ nonisolated struct CameraFrameInput {
 	let settings: CameraSettings
 	/// The wave field alone. `texture` is a blank stand-in and cells follow `pixelSize`.
 	var waveOnly = false
+	/// A cell size in output pixels to use as is, for CRISP photos, instead of fitting the frame exactly
+	var fixedCell: Float?
 
 	/// A 1×1 stand-in so the wave runs through the same kernel, and the same mappings, as the camera.
 	@MainActor
@@ -228,6 +230,9 @@ nonisolated struct CameraFrameInput {
 		guard !waveOnly else {
 			return nil
 		}
+		if let fixedCell {
+			return fixedCell
+		}
 		let fill = max(Float(outputWidth) / Float(max(1, texture.width)), Float(outputHeight) / Float(max(1, texture.height)))
 		let bounded = settings.bounded()
 		#if os(macOS)
@@ -236,6 +241,8 @@ nonisolated struct CameraFrameInput {
 		#else
 			let zoom: Float = 1
 		#endif
-		return max(1, fill * zoom * Float(bounded.cellTexels))
+		// Below a pixel is allowed: a big photo previewed small at 1:1 still shows whole, rather than
+		// clamping to a pixel and cropping in. Each pixel then shows one of the cells it covers.
+		return max(0.05, fill * zoom * Float(bounded.cellTexels))
 	}
 }

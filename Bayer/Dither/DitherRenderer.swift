@@ -99,7 +99,7 @@ public nonisolated struct DitherConfiguration: Equatable, Sendable, Codable {
 		value.waveColor = finiteColor(waveColor, .init(repeating: 0.5))
 		value.backgroundColor = finiteColor(backgroundColor, .zero)
 		value.palette = palette.prefix(Self.supportedPaletteCount).map { finiteColor($0, .init(repeating: 0.5)) }
-		value.ditherMode = min(max(ditherMode, 0), 7)
+		value.ditherMode = min(max(ditherMode, 0), 9)
 		value.backgroundStyle = Self.validBackgroundStyle(backgroundStyle)
 		value.colorPlacement = Self.validColorPlacement(colorPlacement)
 		value.squareStyle = Self.validSquareStyle(squareStyle)
@@ -443,6 +443,21 @@ private final class SharedMetalResources {
 		return pipeline
 	}
 
+	private var diffuseComputePipeline: (any MTLComputePipelineState)?
+
+	/// Atkinson and Floyd-Steinberg, run over the whole cell grid after the camera pass
+	func diffuseComputePipelineState() throws -> any MTLComputePipelineState {
+		if let diffuseComputePipeline {
+			return diffuseComputePipeline
+		}
+		guard let function = library.makeFunction(name: "ditherDiffuseCompute") else {
+			throw NSError(domain: "DitherMetal", code: 4, userInfo: [NSLocalizedDescriptionKey: "Missing Metal shader function: ditherDiffuseCompute"])
+		}
+		let pipeline = try device.makeComputePipelineState(function: function)
+		diffuseComputePipeline = pipeline
+		return pipeline
+	}
+
 	func ditherPipelineState(fused: Bool) throws -> any MTLRenderPipelineState {
 		if fused, let optimizedDitherPipeline {
 			return optimizedDitherPipeline
@@ -571,6 +586,8 @@ final class DitherMetalRenderer {
 	private var fieldTexture: any MTLTexture?
 	private var cellTexture: any MTLTexture?
 	private var joinMaskTexture: any MTLTexture?
+	/// Three rows of pending error for error diffusion, sized to the grid's width
+	private var diffusionErrors: (any MTLBuffer)?
 	private let finalPassDescriptor = MTLRenderPassDescriptor()
 	private let blurSourcePassDescriptor = MTLRenderPassDescriptor()
 	private var fieldSize = MTLSize(width: 1, height: 1, depth: 1)
@@ -867,10 +884,10 @@ final class DitherMetalRenderer {
 			computeEncoder.setComputePipelineState(pipeline)
 			computeEncoder.setTexture(cellTexture, index: 0)
 			computeEncoder.setTexture(gradientTexture, index: 1)
-			if let camera {
-				var cameraUniforms = camera.uniforms(columns: columns, rows: rows)
+			var cameraUniforms = camera?.uniforms(columns: columns, rows: rows)
+			if let camera, cameraUniforms != nil {
 				computeEncoder.setTexture(camera.texture, index: 2)
-				unsafe computeEncoder.setBytes(&cameraUniforms, length: MemoryLayout<CameraUniforms>.stride, index: 5)
+				unsafe computeEncoder.setBytes(&cameraUniforms!, length: MemoryLayout<CameraUniforms>.stride, index: 5)
 			}
 			unsafe computeEncoder.setBytes(&field, length: MemoryLayout<FieldUniforms>.stride, index: 0)
 			unsafe computeEncoder.setBytes(&dither, length: MemoryLayout<DitherUniforms>.stride, index: 1)
@@ -889,6 +906,29 @@ final class DitherMetalRenderer {
 				usesTwoDimensionalThreadgroups: usesTwoDimensionalThreadgroups
 			)
 			computeDispatchCount += 1
+			// Error diffusion: the camera pass left shaped values; one threadgroup now walks the grid
+			if cameraUniforms != nil, configuration.ditherMode >= 8 {
+				let length = columns * 3 * MemoryLayout<SIMD4<Float>>.stride
+				if (diffusionErrors?.length ?? 0) < length {
+					diffusionErrors = device.makeBuffer(length: length, options: .storageModePrivate)
+				}
+				if let diffusionErrors {
+					let diffuse = try sharedResources.diffuseComputePipelineState()
+					computeEncoder.memoryBarrier(scope: .textures)
+					computeEncoder.setComputePipelineState(diffuse)
+					computeEncoder.setTexture(cellTexture, index: 0)
+					unsafe computeEncoder.setBytes(&dither, length: MemoryLayout<DitherUniforms>.stride, index: 0)
+					computeEncoder.setBuffer(paletteBuffer, offset: 0, index: 1)
+					unsafe computeEncoder.setBytes(&cameraUniforms!, length: MemoryLayout<CameraUniforms>.stride, index: 2)
+					computeEncoder.setBuffer(diffusionErrors, offset: 0, index: 3)
+					let lanes = max(1, min(rows, diffuse.maxTotalThreadsPerThreadgroup))
+					computeEncoder.dispatchThreadgroups(
+						MTLSize(width: 1, height: 1, depth: 1),
+						threadsPerThreadgroup: MTLSize(width: lanes, height: 1, depth: 1)
+					)
+					computeDispatchCount += 1
+				}
+			}
 		} else {
 			guard let fieldTexture else {
 				throw NSError(domain: "DitherMetal", code: 6, userInfo: [NSLocalizedDescriptionKey: "Could not allocate field texture"])

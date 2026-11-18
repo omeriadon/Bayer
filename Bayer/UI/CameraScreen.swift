@@ -15,6 +15,10 @@ struct CameraScreen: View {
 	@State private var pinchStart: Double?
 	/// A photo or video picked to dither
 	@State private var picked: PhotosPickerItem?
+	#if os(macOS)
+		@State private var choosingPhoto = false
+		@State private var choosingFile = false
+	#endif
 
 	@Environment(\.displayScale) private var displayScale
 	@Environment(\.scenePhase) private var scenePhase
@@ -347,11 +351,36 @@ struct CameraScreen: View {
 				HStack(spacing: 8) {
 					thumbnail
 					let ink = PixelTheme(palette: model.configuration.palette).ink
-					PhotosPicker(selection: $picked, matching: .any(of: [.images, .videos]), photoLibrary: .shared()) {
-						ImportLabel(color: ink)
-					}
-					.buttonStyle(PixelButtonStyle())
-					.accessibilityLabel("Dither a photo or video")
+					#if os(macOS)
+						// The Mac keeps pictures in Finder as often as in Photos, so it asks which
+						Menu {
+							Button("From Photos…") {
+								choosingPhoto = true
+							}
+							Button("From Files…") {
+								choosingFile = true
+							}
+						} label: {
+							ImportLabel(color: ink)
+						}
+						.menuStyle(.button)
+						.buttonStyle(.plain)
+						.menuIndicator(.hidden)
+						.fixedSize()
+						.accessibilityLabel("Dither a photo or video")
+						.photosPicker(isPresented: $choosingPhoto, selection: $picked, matching: .any(of: [.images, .videos]), photoLibrary: .shared())
+						.fileImporter(isPresented: $choosingFile, allowedContentTypes: [.image, .movie]) { result in
+							if case let .success(url) = result {
+								model.importFile(url)
+							}
+						}
+					#else
+						PhotosPicker(selection: $picked, matching: .any(of: [.images, .videos]), photoLibrary: .shared()) {
+							ImportLabel(color: ink)
+						}
+						.buttonStyle(PixelButtonStyle())
+						.accessibilityLabel("Dither a photo or video")
+					#endif
 					Spacer(minLength: 0)
 				}
 				.frame(width: 100)

@@ -40,7 +40,7 @@ extension EnvironmentValues {
 
 /// 9×9 pixel icons.
 enum PixelIcon: String {
-	case flip, bug, close, minus, plus, grid, pattern, camera, check, photo
+	case flip, bug, close, minus, plus, grid, pattern, camera, check, photo, tune, levels, contrast, drop, wave, more
 
 	var rows: [String] {
 		switch self {
@@ -141,6 +141,72 @@ enum PixelIcon: String {
 					"##..##...",
 					".####....",
 					"..##.....",
+					".........",
+				]
+			case .tune: [
+					".#..#..#.",
+					".#..#..#.",
+					"###.#..#.",
+					".#..#..#.",
+					".#.###.#.",
+					".#..#..#.",
+					".#..#.###",
+					".#..#..#.",
+					".#..#..#.",
+				]
+			case .levels: [
+					".........",
+					"......###",
+					"......###",
+					"...######",
+					"...######",
+					"#########",
+					"#########",
+					"#########",
+					".........",
+				]
+			case .contrast: [
+					"..#####..",
+					".#..####.",
+					"#...#####",
+					"#...#####",
+					"#...#####",
+					"#...#####",
+					"#...#####",
+					".#..####.",
+					"..#####..",
+				]
+			case .drop: [
+					"....#....",
+					"...###...",
+					"...###...",
+					"..#####..",
+					".#######.",
+					".######.#",
+					".#####.##",
+					"..#####..",
+					"...###...",
+				]
+			case .wave: [
+					".........",
+					".##...##.",
+					"#..#.#..#",
+					"....#....",
+					".........",
+					".##...##.",
+					"#..#.#..#",
+					"....#....",
+					".........",
+				]
+			case .more: [
+					".........",
+					".........",
+					".........",
+					"##.##.##.",
+					"##.##.##.",
+					".........",
+					".........",
+					".........",
 					".........",
 				]
 			case .photo: [
@@ -379,13 +445,15 @@ struct PixelTrack: View {
 	let count: Int
 	@Binding var index: Int
 	var fills = true
+	var titleWidth: CGFloat = 84
+	var valueWidth: CGFloat = 70
 
 	@Environment(\.pixelTheme) private var theme
 
 	var body: some View {
 		HStack(spacing: 10) {
-			PixelText(title, cell: 2, color: theme.mid)
-				.frame(width: 70, alignment: .leading)
+			PixelText(title, cell: 1.7, color: theme.mid)
+				.frame(width: titleWidth, alignment: .leading)
 			GeometryReader { proxy in
 				Canvas { context, size in
 					// Cells stay roughly square however many steps there are
@@ -429,7 +497,7 @@ struct PixelTrack: View {
 			}
 			.frame(height: 14)
 			PixelText(value, cell: 2, color: theme.ink)
-				.frame(width: 70, alignment: .trailing)
+				.frame(width: valueWidth, alignment: .trailing)
 		}
 		.padding(.vertical, 2)
 		.pixelPanel(padding: 9)

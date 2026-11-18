@@ -1,10 +1,15 @@
 import SwiftUI
+#if canImport(NotchMyProblem)
+	import NotchMyProblem
+#endif
+#if os(iOS)
+	import AVKit
+#endif
 
 struct CameraScreen: View {
 	@Bindable var model: AppModel
 
 	@State private var previewSize = CGSize.zero
-	@State private var detent = Self.third
 	/// The zoom when a pinch began
 	@State private var pinchStart: Double?
 
@@ -15,12 +20,8 @@ struct CameraScreen: View {
 		@Environment(\.horizontalSizeClass) private var horizontalSizeClass
 	#endif
 
-	/// On iPhone the debug sheet stops at a third or a half, with the controls just above it.
-	static let third = PresentationDetent.fraction(1 / 3)
-	static let half = PresentationDetent.fraction(1 / 2)
-
-	/// iPad and Mac have room for debug as a side inspector instead of a sheet
-	private var usesInspector: Bool {
+	/// iPad and Mac put the controls in a column on the right
+	private var isRegular: Bool {
 		#if os(iOS)
 			horizontalSizeClass == .regular
 		#else
@@ -32,16 +33,15 @@ struct CameraScreen: View {
 		let theme = PixelTheme(palette: model.configuration.palette)
 		GeometryReader { proxy in
 			let landscape = proxy.size.width > proxy.size.height
-			let column = landscape || usesInspector
-			let fullHeight = proxy.size.height + proxy.safeAreaInsets.top + proxy.safeAreaInsets.bottom
-			let fraction: CGFloat = detent == Self.half ? 1 / 2 : 1 / 3
-			let lift = model.debugOpen && !column ? fullHeight * fraction - proxy.safeAreaInsets.bottom + 8 : 0
+			let column = landscape || isRegular
+			// Only a portrait iPhone has a notch or island across the top to sit beside
+			let besideCutout = !column && !Platform.isMac
 			ZStack {
 				theme.paper.ignoresSafeArea()
 
 				DitherCameraView(
 					configuration: model.configuration,
-					camera: model.camera,
+					camera: shownCamera,
 					frames: model.controller.frames,
 					clock: model.waveClock
 				)
@@ -64,31 +64,44 @@ struct CameraScreen: View {
 						.transition(.pixelDissolve)
 				}
 
-				if column {
+				if !model.hasOnboarded {
+					Onboarding {
+						Task { await model.finishOnboarding() }
+					}
+					.transition(.pixelDissolve)
+				} else if besideCutout {
+					cutoutButtons
+				}
+
+				if !model.hasOnboarded {
+					// The welcome has the screen to itself
+				} else if column {
 					HStack(spacing: 0) {
 						Spacer(minLength: 0)
 						VStack(spacing: 8) {
-							topBar
+							cornerButtons
 							Spacer(minLength: 0)
 							controls(spacing: 8)
 						}
-						.frame(width: 350)
+						.frame(width: 360)
 					}
 					.padding(.horizontal, 10)
 					.padding(.vertical, 4)
 				} else {
 					VStack(spacing: 0) {
-						topBar
+						if !besideCutout {
+							cornerButtons
+						}
 						Spacer()
 						controls(spacing: 10)
-							.padding(.bottom, lift)
 					}
 					.padding(.horizontal, 14)
 				}
 			}
-			.animation(.snappy, value: model.debugOpen)
-			.animation(.snappy, value: detent)
 			.animation(.easeInOut(duration: 0.3), value: model.toast)
+			.animation(.easeInOut(duration: 0.28), value: model.section)
+			.animation(.easeInOut(duration: 0.28), value: model.settingsOpen)
+			.animation(.easeInOut(duration: 0.35), value: model.hasOnboarded)
 			.onChange(of: landscape, initial: true) { _, landscape in
 				model.controller.setInterfaceIsPortrait(!landscape)
 			}
@@ -96,7 +109,6 @@ struct CameraScreen: View {
 		.environment(\.pixelTheme, theme)
 		.preferredColorScheme(.dark)
 		.hidesSystemChrome()
-		.modifier(DebugPresentation(model: model, detent: $detent, asInspector: usesInspector, theme: theme))
 		.fullScreen(isPresented: $model.viewingPhoto) {
 			if let photo = model.lastPhoto {
 				PhotoViewer(image: photo)
@@ -121,6 +133,18 @@ struct CameraScreen: View {
 				case nil: nil
 			}
 		}
+		.modifier(HardwareShutter {
+			model.capture(viewSize: previewSize, scale: displayScale)
+		})
+	}
+
+	/// The welcome shows the wave behind it, since the camera isn't asked for until the end
+	private var shownCamera: CameraSettings {
+		var camera = model.camera
+		if !model.hasOnboarded {
+			camera.usesCamera = false
+		}
+		return camera
 	}
 
 	private var pinch: some Gesture {
@@ -137,26 +161,88 @@ struct CameraScreen: View {
 
 	// MARK: Top
 
-	private var topBar: some View {
-		HStack(spacing: 10) {
-			Spacer()
-			PixelIconButton(
-				icon: .camera,
-				lit: model.camera.usesCamera,
-				label: model.camera.usesCamera ? "Turn camera off" : "Turn camera on"
-			) {
-				model.camera.usesCamera.toggle()
-			}
-			PixelIconButton(icon: .bug, lit: model.debugOpen, label: model.debugOpen ? "Hide debug" : "Show debug") {
-				model.debugOpen.toggle()
-			}
+	private var cameraButton: some View {
+		TopButton(icon: .camera, title: "CAM", lit: model.camera.usesCamera, label: model.camera.usesCamera ? "Turn camera off" : "Turn camera on") {
+			model.camera.usesCamera.toggle()
 		}
-		.padding(.top, 6)
+	}
+
+	private var settingsButton: some View {
+		TopButton(icon: .tune, title: "TUNE", lit: model.settingsOpen, label: model.settingsOpen ? "Hide settings" : "Show settings") {
+			model.settingsOpen.toggle()
+		}
+	}
+
+	/// Either side of the Dynamic Island or notch
+	@ViewBuilder
+	private var cutoutButtons: some View {
+		#if canImport(NotchMyProblem)
+			CutoutAccessoryView(padding: .auto) {
+				cameraButton
+			} trailingContent: {
+				settingsButton
+			}
+		#else
+			VStack {
+				cornerButtons
+				Spacer()
+			}
+		#endif
+	}
+
+	/// In the top corners, wherever there's no cutout to sit beside
+	private var cornerButtons: some View {
+		HStack {
+			cameraButton
+			Spacer()
+			settingsButton
+		}
+		.padding(.top, 4)
 	}
 
 	// MARK: Bottom
 
 	private func controls(spacing: CGFloat) -> some View {
+		VStack(spacing: 4) {
+			VStack(spacing: spacing) {
+				if model.settingsOpen {
+					SectionBar(sections: SettingsSection.available(usesCamera: model.camera.usesCamera), selection: $model.section)
+						.transition(.pixelDissolve)
+				}
+				// The main controls and each section page dissolve into one another in the same place
+				ZStack(alignment: .bottom) {
+					if let section = model.section {
+						SectionPage(section: section, model: model)
+							.id(section)
+							.transition(.pixelDissolve)
+					} else {
+						mainControls(spacing: spacing)
+							.transition(.pixelDissolve)
+					}
+				}
+			}
+			// Camera Control's overlay takes over; the sliders and pages step aside until it's gone
+			.modifier(PixelDissolve(amount: model.cameraControlOverlay ? 0 : 1))
+			.allowsHitTesting(!model.cameraControlOverlay)
+			.animation(.easeInOut(duration: 0.25), value: model.cameraControlOverlay)
+			HStack {
+				thumbnail
+				Spacer()
+				PixelShutter(capturing: model.isCapturing) {
+					model.capture(viewSize: previewSize, scale: displayScale)
+				}
+				Spacer()
+				PixelIconButton(icon: .flip, label: "Switch camera") {
+					model.flipCamera()
+				}
+				.opacity(model.camera.usesCamera ? 1 : 0.35)
+				.disabled(!model.camera.usesCamera)
+				.frame(width: 64)
+			}
+		}
+	}
+
+	private func mainControls(spacing: CGFloat) -> some View {
 		VStack(spacing: spacing) {
 			if model.camera.usesCamera, model.zoomRange.presets.count > 1 || model.zoomRange.maximum > model.zoomRange.minimum {
 				ZoomChips(range: model.zoomRange, zoom: model.camera.zoom) {
@@ -183,20 +269,6 @@ struct CameraScreen: View {
 				index: $model.strengthIndex
 			)
 			PaletteStrip(selected: model.palette) { model.select($0) }
-			HStack {
-				thumbnail
-				Spacer()
-				PixelShutter(capturing: model.isCapturing) {
-					model.capture(viewSize: previewSize, scale: displayScale)
-				}
-				Spacer()
-				PixelIconButton(icon: .flip, label: "Switch camera") {
-					model.flipCamera()
-				}
-				.opacity(model.camera.usesCamera ? 1 : 0.35)
-				.disabled(!model.camera.usesCamera)
-				.frame(width: 64)
-			}
 		}
 	}
 
@@ -329,7 +401,7 @@ private struct PaletteStrip: View {
 				}
 			}
 			.padding(.horizontal, 2)
-			.padding(.vertical, 3)
+			.padding(.vertical, 2)
 		}
 		.scrollIndicators(.hidden)
 		.scrollEdgeEffectHidden()
@@ -422,33 +494,6 @@ private struct PhotoViewer: View {
 	}
 }
 
-/// Debug as a sheet on iPhone, sitting at a third or a half, and as a side inspector on iPad and Mac.
-private struct DebugPresentation: ViewModifier {
-	@Bindable var model: AppModel
-	@Binding var detent: PresentationDetent
-	let asInspector: Bool
-	let theme: PixelTheme
-
-	func body(content: Content) -> some View {
-		if asInspector {
-			content.inspector(isPresented: $model.debugOpen) {
-				DebugPanel(model: model)
-					.environment(\.pixelTheme, theme)
-					.inspectorColumnWidth(min: 300, ideal: 340, max: 440)
-			}
-		} else {
-			content.sheet(isPresented: $model.debugOpen) {
-				DebugPanel(model: model)
-					.environment(\.pixelTheme, theme)
-					.presentationDetents([CameraScreen.third, CameraScreen.half], selection: $detent)
-					.presentationBackgroundInteraction(.enabled)
-					.presentationDragIndicator(.visible)
-					.presentationContentInteraction(.scrolls)
-			}
-		}
-	}
-}
-
 /// The lenses' zooms as chips. The nearest one lights and shows the exact zoom while you pinch.
 private struct ZoomChips: View {
 	let range: ZoomRange
@@ -481,5 +526,48 @@ private struct ZoomChips: View {
 	static func title(_ zoom: Double) -> String {
 		let rounded = (zoom * 10).rounded() / 10
 		return rounded == rounded.rounded() ? "\(Int(rounded))×" : "\(rounded)×"
+	}
+}
+
+/// A wide, short button for the top of the screen: an icon and a word.
+private struct TopButton: View {
+	let icon: PixelIcon
+	let title: String
+	let lit: Bool
+	let label: String
+	let action: () -> Void
+
+	@Environment(\.pixelTheme) private var theme
+
+	var body: some View {
+		Button(action: action) {
+			HStack(spacing: 6) {
+				PixelIconView(icon: icon, cell: 1.8, color: lit ? theme.paper : theme.ink)
+				PixelText(title, cell: 1.8, color: lit ? theme.paper : theme.ink)
+			}
+			.padding(.horizontal, 4)
+			.pixelPanel(lit: lit, padding: 6)
+		}
+		.buttonStyle(PixelButtonStyle())
+		.accessibilityLabel(label)
+	}
+}
+
+/// Camera Control's press, and the volume buttons, take a photo on iPhone. Nothing like it on the Mac.
+private struct HardwareShutter: ViewModifier {
+	let capture: () -> Void
+
+	func body(content: Content) -> some View {
+		#if os(iOS)
+			// The system plays the shutter sound for these presses
+			content.onCameraCaptureEvent(isEnabled: true, defaultSoundDisabled: false) { event in
+				// On release, like the Camera app, so a press and hold doesn't fire twice
+				if event.phase == .ended {
+					capture()
+				}
+			}
+		#else
+			content
+		#endif
 	}
 }

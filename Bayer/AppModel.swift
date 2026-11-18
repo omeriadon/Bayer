@@ -1,7 +1,20 @@
 import CoreGraphics
+import Defaults
 import Metal
 import Observation
 import SwiftUI
+
+nonisolated extension DitherConfiguration: Defaults.Serializable {}
+nonisolated extension CameraSettings: Defaults.Serializable {}
+
+nonisolated extension Defaults.Keys {
+	static let configuration = Key<DitherConfiguration>("configuration", default: .bayerDefault)
+	static let camera = Key<CameraSettings>("camera", default: CameraSettings())
+	/// The TUNE section bar, left open or closed
+	static let settingsOpen = Key<Bool>("settingsOpen", default: false)
+	/// The welcome has been seen; the camera is only asked for after it
+	static let hasOnboarded = Key<Bool>("hasOnboarded", default: false)
+}
 
 @Observable
 final class AppModel {
@@ -9,14 +22,21 @@ final class AppModel {
 		case unknown, running, denied
 	}
 
-	var configuration: DitherConfiguration {
-		didSet { save(configuration, key: Keys.configuration) }
+	var configuration = Defaults[.configuration] {
+		didSet {
+			Defaults[.configuration] = configuration
+			syncCameraControl()
+		}
 	}
 
-	var camera: CameraSettings {
+	var camera = Defaults[.camera] {
 		didSet {
-			save(camera, key: Keys.camera)
+			Defaults[.camera] = camera
+			syncCameraControl()
 			if camera.usesCamera != oldValue.usesCamera {
+				if camera.usesCamera, section == .wave {
+					section = nil
+				}
 				if camera.usesCamera {
 					Task { await startCamera() }
 				} else {
@@ -31,7 +51,18 @@ final class AppModel {
 	}
 
 	var zoomRange = ZoomRange()
-	var debugOpen = false
+	/// The section bar is showing. Remembered between launches.
+	var settingsOpen = Defaults[.settingsOpen] {
+		didSet {
+			Defaults[.settingsOpen] = settingsOpen
+			if !settingsOpen {
+				section = nil
+			}
+		}
+	}
+
+	/// The open section, which takes the main controls' place
+	var section: SettingsSection?
 	var viewingPhoto = false
 	var status = CameraStatus.unknown
 	var lastPhoto: CGImage?
@@ -40,30 +71,67 @@ final class AppModel {
 	var photoNote: PhotoNote?
 	var captureCount = 0
 	var isCapturing = false
-
-	let controller = CameraController(device: MTLCreateSystemDefaultDevice())
-	let waveClock = WaveClock()
-
-	private enum Keys {
-		static let configuration = "bayer.configuration.v1"
-		static let camera = "bayer.camera.v1"
+	/// Camera Control's overlay is covering the screen, so the app's controls step aside
+	var cameraControlOverlay = false
+	/// False until the welcome is done. Until then the picture is the wave and the camera isn't asked for.
+	var hasOnboarded = Defaults[.hasOnboarded] {
+		didSet { Defaults[.hasOnboarded] = hasOnboarded }
 	}
 
+	let controller = CameraController(
+		device: MTLCreateSystemDefaultDevice(),
+		styleTitles: DitherMode.allCases.map(\.title.capitalized)
+	)
+	let waveClock = WaveClock()
+
 	init() {
-		configuration = Self.load(Keys.configuration) ?? .bayerDefault
-		camera = Self.load(Keys.camera) ?? CameraSettings()
 		let ranges = controller.zoomRanges
 		Task { [weak self] in
 			for await range in ranges {
 				self?.zoomRange = range
 			}
 		}
+		let events = controller.controlEvents
+		Task { [weak self] in
+			for await event in events {
+				self?.apply(event)
+			}
+		}
+		syncCameraControl()
+	}
+
+	// MARK: Camera Control
+
+	/// Applies what was done on Camera Control. Zoom only updates the number shown: the system
+	/// slider has already moved the lens.
+	private func apply(_ event: CameraControlEvent) {
+		switch event {
+			case let .zoom(zoom): camera.zoom = zoom
+			case let .texels(texels): camera.texelsPerCell = texels
+			case let .dither(dither): configuration.ditherStrength = dither
+			case let .style(index): patternIndex = index
+			case let .palette(index):
+				if DitherPalette.all.indices.contains(index) {
+					select(DitherPalette.all[index])
+				}
+			case let .overlay(covering): cameraControlOverlay = covering
+		}
+	}
+
+	/// Keeps Camera Control's sliders where the app's are
+	private func syncCameraControl() {
+		controller.syncControls(CameraControlValues(
+			texels: camera.texelsPerCell,
+			dither: configuration.ditherStrength,
+			style: patternIndex,
+			palette: palette.flatMap { current in DitherPalette.all.firstIndex(of: current) }
+		))
 	}
 
 	// MARK: Camera
 
 	func startCamera() async {
-		guard camera.usesCamera else {
+		guard camera.usesCamera, hasOnboarded else {
 			return
 		}
 		if await CameraController.requestAccess() {
@@ -138,9 +206,17 @@ final class AppModel {
 		camera = CameraSettings()
 	}
 
-	/// The name shows once at launch, then gets out of the way.
+	/// The name shows once at launch, then gets out of the way. The welcome says it instead the first time.
 	func announce() {
-		show("BAYER")
+		if hasOnboarded {
+			show("BAYER")
+		}
+	}
+
+	/// Ends the welcome and asks for the camera, now that it's been explained
+	func finishOnboarding() async {
+		hasOnboarded = true
+		await startCamera()
 	}
 
 	// MARK: Capture
@@ -200,21 +276,6 @@ final class AppModel {
 				toast = nil
 			}
 		}
-	}
-
-	// MARK: Persistence
-
-	private func save(_ value: some Encodable, key: String) {
-		if let data = try? JSONEncoder().encode(value) {
-			UserDefaults.standard.set(data, forKey: key)
-		}
-	}
-
-	private static func load<T: Decodable>(_ key: String) -> T? {
-		guard let data = UserDefaults.standard.data(forKey: key) else {
-			return nil
-		}
-		return try? JSONDecoder().decode(T.self, from: data)
 	}
 }
 

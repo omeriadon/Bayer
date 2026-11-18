@@ -46,12 +46,39 @@ nonisolated struct ZoomRange: Equatable, Sendable {
 	var digital = false
 }
 
+/// Something done on Camera Control, for the app to show and apply.
+nonisolated enum CameraControlEvent: Sendable {
+	/// The system zoom slider already zoomed the lens; this is just the new zoom as people say it
+	case zoom(Double)
+	/// Camera pixels along a cell's side
+	case texels(Int)
+	/// 0...1
+	case dither(Float)
+	case style(Int)
+	case palette(Int)
+	/// Camera Control's overlay covering the screen, or not
+	case overlay(Bool)
+}
+
+/// Where Camera Control's own sliders should sit, kept in step with the app's controls.
+nonisolated struct CameraControlValues: Equatable, Sendable {
+	var texels = 10
+	var dither: Float = 1
+	var style = 0
+	var palette: Int?
+}
+
 /// Runs the capture session. Everything here happens on its own queues, never the main actor.
 nonisolated final class CameraController: NSObject, AVCaptureVideoDataOutputSampleBufferDelegate, @unchecked Sendable {
 	let frames = LatestCameraFrame()
 	/// A new range each time the camera changes
 	let zoomRanges: AsyncStream<ZoomRange>
 	private let zoomContinuation: AsyncStream<ZoomRange>.Continuation
+	/// Everything done on Camera Control
+	let controlEvents: AsyncStream<CameraControlEvent>
+	private let controlContinuation: AsyncStream<CameraControlEvent>.Continuation
+	/// The dither patterns' names, for the Style picker on Camera Control
+	private let styleTitles: [String]
 
 	private let session = AVCaptureSession()
 	private let output = AVCaptureVideoDataOutput()
@@ -64,18 +91,25 @@ nonisolated final class CameraController: NSObject, AVCaptureVideoDataOutputSamp
 	private var input: AVCaptureDeviceInput?
 	private var usesFrontCamera = false
 	private var interfaceIsPortrait = true
+	private var controlValues = CameraControlValues()
 	#if os(iOS)
 		private var rotationCoordinator: AVCaptureDevice.RotationCoordinator?
 		private var rotationObservation: NSKeyValueObservation?
+		private var sizeSlider: AVCaptureSlider?
+		private var ditherSlider: AVCaptureSlider?
+		private var stylePicker: AVCaptureIndexPicker?
+		private var palettePicker: AVCaptureIndexPicker?
 	#endif
 
-	init(device: (any MTLDevice)?) {
+	init(device: (any MTLDevice)?, styleTitles: [String]) {
 		var cache: CVMetalTextureCache?
 		if let device {
 			unsafe CVMetalTextureCacheCreate(kCFAllocatorDefault, nil, device, nil, &cache)
 		}
 		textureCache = cache
+		self.styleTitles = styleTitles
 		(zoomRanges, zoomContinuation) = AsyncStream.makeStream(bufferingPolicy: .bufferingNewest(1))
+		(controlEvents, controlContinuation) = AsyncStream.makeStream(bufferingPolicy: .unbounded)
 		super.init()
 	}
 
@@ -175,6 +209,12 @@ nonisolated final class CameraController: NSObject, AVCaptureVideoDataOutputSamp
 			session.addOutput(output)
 		}
 		session.commitConfiguration()
+		#if os(iOS)
+			// Controls only come alive once the session has a controls delegate
+			if session.supportsControls {
+				session.setControlsDelegate(self, queue: sessionQueue)
+			}
+		#endif
 		configured = true
 	}
 
@@ -244,6 +284,22 @@ nonisolated final class CameraController: NSObject, AVCaptureVideoDataOutputSamp
 		session.commitConfiguration()
 		usesFrontCamera = front
 		zoomContinuation.yield(Self.zoomRange(for: device))
+		#if os(iOS)
+			installControls(for: device)
+		#endif
+	}
+
+	/// Moves Camera Control's sliders to match the app, after a change made on screen.
+	func syncControls(_ values: CameraControlValues) {
+		sessionQueue.async { [self] in
+			guard values != controlValues else {
+				return
+			}
+			controlValues = values
+			#if os(iOS)
+				applyControlValues()
+			#endif
+		}
 	}
 
 	private static func zoomRange(for device: AVCaptureDevice) -> ZoomRange {
@@ -277,3 +333,93 @@ nonisolated final class CameraController: NSObject, AVCaptureVideoDataOutputSamp
 		frames.publish(.init(texture: texture, owner: .init(cvTexture)))
 	}
 }
+
+// MARK: Camera Control
+
+#if os(iOS)
+	/// Runs on the session queue like the rest of the controller, never the main actor.
+	nonisolated extension CameraController: AVCaptureSessionControlsDelegate {
+		/// Zoom, size, dither, style and palette, each its own slider or picker on Camera Control. Rebuilt per
+		/// camera, since the zoom slider belongs to one device.
+		private func installControls(for device: AVCaptureDevice) {
+			guard session.supportsControls else {
+				return
+			}
+			for control in session.controls {
+				session.removeControl(control)
+			}
+			let events = controlContinuation
+			let multiplier = Double(device.displayVideoZoomFactorMultiplier)
+
+			// The system's own zoom slider moves the lens itself, with the Camera app's lens markers
+			let zoom = AVCaptureSystemZoomSlider(device: device) { factor in
+				events.yield(.zoom(Double(factor) * multiplier))
+			}
+
+			// Size as the ratio people see in the app, 1:1 to 1:1024, so the slider's numbers match
+			let ratios = CameraSettings.texelSteps.map { Float($0 * $0) }
+			let size = AVCaptureSlider("Cell size", symbolName: "square.grid.2x2", values: ratios)
+			size.localizedValueFormat = "1:%.0f"
+			size.prominentValues = [1, 16, 100, 400]
+			size.setActionQueue(sessionQueue) { ratio in
+				events.yield(.texels(Int(ratio.squareRoot().rounded())))
+			}
+
+			let dither = AVCaptureSlider("Dither", symbolName: "checkerboard.rectangle", in: 0 ... 100, step: 5)
+			dither.localizedValueFormat = "%.0f%%"
+			dither.prominentValues = [0, 50, 100]
+			dither.setActionQueue(sessionQueue) { value in
+				events.yield(.dither(value / 100))
+			}
+
+			let style = AVCaptureIndexPicker("Style", symbolName: "circle.grid.3x3", localizedIndexTitles: styleTitles)
+			style.setActionQueue(sessionQueue) { index in
+				events.yield(.style(index))
+			}
+
+			let palette = AVCaptureIndexPicker(
+				"Palette",
+				symbolName: "paintpalette",
+				localizedIndexTitles: DitherPalette.all.map(\.name.capitalized)
+			)
+			palette.setActionQueue(sessionQueue) { index in
+				events.yield(.palette(index))
+			}
+
+			session.beginConfiguration()
+			for control in [zoom, size, dither, style, palette] as [AVCaptureControl] where session.canAddControl(control) {
+				session.addControl(control)
+			}
+			session.commitConfiguration()
+			sizeSlider = size
+			ditherSlider = dither
+			stylePicker = style
+			palettePicker = palette
+			applyControlValues()
+		}
+
+		private func applyControlValues() {
+			sizeSlider?.value = Float(controlValues.texels * controlValues.texels)
+			ditherSlider?.value = (controlValues.dither * 100).rounded()
+			stylePicker?.selectedIndex = controlValues.style
+			if let index = controlValues.palette {
+				palettePicker?.selectedIndex = index
+			}
+		}
+
+		func sessionControlsDidBecomeActive(_: AVCaptureSession) {}
+
+		/// Camera Control's overlay is about to cover the screen; the app's own controls step aside
+		func sessionControlsWillEnterFullscreenAppearance(_: AVCaptureSession) {
+			controlContinuation.yield(.overlay(true))
+		}
+
+		func sessionControlsWillExitFullscreenAppearance(_: AVCaptureSession) {
+			controlContinuation.yield(.overlay(false))
+		}
+
+		func sessionControlsDidBecomeInactive(_: AVCaptureSession) {
+			controlContinuation.yield(.overlay(false))
+		}
+	}
+#endif

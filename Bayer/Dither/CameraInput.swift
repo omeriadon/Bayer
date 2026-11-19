@@ -54,14 +54,27 @@ nonisolated struct CameraSettings: Equatable, Sendable, Codable {
 	var depthNear: Float = 0.25
 	var depthFar: Float = 5
 
-	static let depthNearSteps: [Float] = [0.1, 0.2, 0.25, 0.3, 0.4, 0.5, 0.75, 1, 1.5, 2, 3]
-	/// The scanner reads to about 5 m
-	static let depthFarSteps: [Float] = [0.5, 0.75, 1, 1.5, 2, 2.5, 3, 4, 5]
+	/// The depth track's stops, 5 cm to 10 m: 5 cm apart up close, 10 cm to 3 m, then 25 cm.
+	/// The scanner reads to 10 m or more.
+	static let depthSteps: [Float] = ladder(from: 5, [(100, 5), (300, 10), (1000, 25)])
+	/// Far stays at least this many times near, so the tones never collapse into one colour
+	static let depthMinimumRatio: Float = 1.5
+
+	/// Metres from whole centimetres, so steps like 0.15 come out exact and compare cleanly
+	private static func ladder(from start: Int, _ legs: [(upTo: Int, step: Int)]) -> [Float] {
+		var centimetres = [start]
+		for leg in legs {
+			while let last = centimetres.last, last + leg.step <= leg.upTo {
+				centimetres.append(last + leg.step)
+			}
+		}
+		return centimetres.map { Float($0) / 100 }
+	}
 
 	/// Near and far, kept apart so the tones never collapse into one colour
 	var depthRange: ClosedRange<Float> {
-		let near = min(max(depthNear.isFinite ? depthNear : 0.25, 0.05), 4)
-		let far = min(max(depthFar.isFinite ? depthFar : 5, near * 1.5), 8)
+		let near = min(max(depthNear.isFinite ? depthNear : 0.25, 0.05), 6.5)
+		let far = min(max(depthFar.isFinite ? depthFar : 5, near * Self.depthMinimumRatio), 10)
 		return near ... far
 	}
 

@@ -141,26 +141,17 @@ struct SectionPage: View {
 	}
 
 	private var depth: some View {
-		Group {
-			ValueTrack(title: "NEAR", values: CameraSettings.depthNearSteps, value: Binding {
-				model.camera.depthNear
-			} set: { near in
-				// Far moves out of the way when near passes it
-				var camera = model.camera
-				camera.depthNear = near
-				if camera.depthFar < near * 1.5 {
-					camera.depthFar = CameraSettings.depthFarSteps.first { $0 >= near * 1.5 } ?? CameraSettings.depthFarSteps.last ?? 5
-				}
-				model.camera = camera
-			}, format: Steps.metres)
-			ValueTrack(
-				title: "FAR",
-				// Always past near, so the tones have room
-				values: CameraSettings.depthFarSteps.filter { $0 >= model.camera.depthNear * 1.5 },
-				value: $model.camera.depthFar,
-				format: Steps.metres
-			)
-		}
+		PixelRangeTrack(
+			title: "RANGE",
+			values: CameraSettings.depthSteps,
+			lower: $model.camera.depthNear,
+			upper: $model.camera.depthFar,
+			lowerName: "Near",
+			upperName: "Far",
+			minimumRatio: CameraSettings.depthMinimumRatio,
+			format: Steps.decimal,
+			unit: " M"
+		)
 	}
 
 	private var wave: some View {

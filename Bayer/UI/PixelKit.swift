@@ -515,8 +515,10 @@ struct PixelTrack: View {
 				.frame(width: titleWidth, alignment: .leading)
 			GeometryReader { proxy in
 				Canvas { context, size in
-					// Cells stay roughly square however many steps there are
-					let target = max(count, Int(size.width / (size.height / 2)))
+					// Cells stay roughly square however many steps there are. A filling track
+					// doesn't need a column per step, so long fine-grained lists don't squash it.
+					let square = max(1, Int(size.width / (size.height / 2)))
+					let target = fills ? square : max(count, square)
 					let perStep = max(1, target / max(count, 1))
 					let columns = fills ? target : count * perStep
 					let width = size.width / CGFloat(columns)
@@ -574,5 +576,152 @@ struct PixelTrack: View {
 				@unknown default: break
 			}
 		}
+	}
+}
+
+/// One track with two ends over a fixed list of values. The lit run between the ends is the range;
+/// a drag moves whichever end is nearer where it starts.
+struct PixelRangeTrack: View {
+	let title: String
+	let values: [Float]
+	@Binding var lower: Float
+	@Binding var upper: Float
+	/// What VoiceOver calls each end
+	var lowerName = "Lower"
+	var upperName = "Upper"
+	/// The upper end stays at least this many times the lower
+	var minimumRatio: Float = 1
+	let format: (Float) -> String
+	var unit = ""
+
+	@Environment(\.pixelTheme) private var theme
+	@State private var grabbed: End?
+
+	private enum End {
+		case lower, upper
+	}
+
+	var body: some View {
+		VStack(spacing: 10) {
+			HStack(spacing: 10) {
+				PixelText(title, cell: 1.7, color: theme.mid)
+				Spacer(minLength: 8)
+				PixelText(format(lower) + "-" + format(upper) + unit, cell: 2, color: theme.ink)
+			}
+			GeometryReader { proxy in
+				Canvas { context, size in
+					// Square cells, however many stops there are
+					let height = size.height / 2
+					let columns = max(2, Int(size.width / height))
+					let width = size.width / CGFloat(columns)
+					let first = column(for: lowerIndex, of: columns)
+					let last = column(for: upperIndex, of: columns)
+					var ends = Path()
+					var run = Path()
+					var dim = Path()
+					for column in 0 ..< columns {
+						for row in 0 ..< 2 {
+							let rect = CGRect(x: CGFloat(column) * width, y: CGFloat(row) * height, width: width, height: height)
+								.insetBy(dx: min(width, height) * 0.16, dy: min(width, height) * 0.16)
+							let radius = min(rect.width, rect.height) * 0.22
+							let corner = CGSize(width: radius, height: radius)
+							if column == first || column == last {
+								ends.addRoundedRect(in: rect, cornerSize: corner)
+							} else if column > first, column < last {
+								run.addRoundedRect(in: rect, cornerSize: corner)
+							} else {
+								dim.addRoundedRect(in: rect, cornerSize: corner)
+							}
+						}
+					}
+					context.fill(dim, with: .color(theme.mid.opacity(0.3)))
+					context.fill(run, with: .color(theme.ink.opacity(0.55)))
+					context.fill(ends, with: .color(theme.ink))
+				}
+				.contentShape(Rectangle())
+				.gesture(
+					DragGesture(minimumDistance: 0)
+						.onChanged { drag in
+							let fraction = min(max(drag.location.x / max(proxy.size.width, 1), 0), 1)
+							let step = Int((fraction * CGFloat(values.count - 1)).rounded())
+							let end = grabbed ?? (abs(step - lowerIndex) <= abs(step - upperIndex) ? .lower : .upper)
+							grabbed = end
+							move(end, to: step)
+						}
+						.onEnded { _ in
+							grabbed = nil
+						}
+				)
+			}
+			.frame(height: 14)
+		}
+		.padding(.vertical, 2)
+		.pixelPanel(padding: 9)
+		.sensoryFeedback(.pixelStep, trigger: lowerIndex * 10000 + upperIndex)
+		.accessibilityElement(children: .contain)
+		.accessibilityLabel(title.capitalized)
+		.accessibilityChildren {
+			endElement(.lower, name: lowerName)
+			endElement(.upper, name: upperName)
+		}
+	}
+
+	private func endElement(_ end: End, name: String) -> some View {
+		let index = end == .lower ? lowerIndex : upperIndex
+		return Rectangle()
+			.accessibilityLabel(name)
+			.accessibilityValue((format(values[index]) + unit).capitalized)
+			.accessibilityAdjustableAction { direction in
+				switch direction {
+					case .increment: move(end, to: index + 1)
+					case .decrement: move(end, to: index - 1)
+					@unknown default: break
+				}
+			}
+	}
+
+	private func nearestIndex(to value: Float) -> Int {
+		values.indices.min { abs(values[$0] - value) < abs(values[$1] - value) } ?? 0
+	}
+
+	private var lowerIndex: Int {
+		nearestIndex(to: lower)
+	}
+
+	private var upperIndex: Int {
+		nearestIndex(to: upper)
+	}
+
+	private func column(for index: Int, of columns: Int) -> Int {
+		guard values.count > 1 else {
+			return 0
+		}
+		return Int((Double(index) / Double(values.count - 1) * Double(columns - 1)).rounded())
+	}
+
+	/// Moves one end, stopping where it would get too close to the other
+	private func move(_ end: End, to step: Int) {
+		guard !values.isEmpty else {
+			return
+		}
+		let step = min(max(step, 0), values.count - 1)
+		let index: Int
+		switch end {
+			case .lower:
+				let highest = values.lastIndex { $0 * minimumRatio <= upper + 0.0001 } ?? 0
+				index = min(step, highest)
+				guard index != lowerIndex else {
+					return
+				}
+				lower = values[index]
+			case .upper:
+				let lowest = values.firstIndex { $0 >= lower * minimumRatio - 0.0001 } ?? values.count - 1
+				index = max(step, lowest)
+				guard index != upperIndex else {
+					return
+				}
+				upper = values[index]
+		}
+		ChipSounds.shared.play(.tick(values.count > 1 ? Double(index) / Double(values.count - 1) : 0))
 	}
 }

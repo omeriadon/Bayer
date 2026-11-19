@@ -5,6 +5,7 @@ import ImageIO
 import Metal
 import Photos
 import UniformTypeIdentifiers
+import VideoToolbox
 
 /// A video picked from the library, copied somewhere Bayer can read it.
 nonisolated struct PickedMovie: Transferable {
@@ -36,8 +37,16 @@ final class DitherMovieWriter {
 	private let writer: AVAssetWriter
 	private let input: AVAssetWriterInput
 	private let adaptor: AVAssetWriterInputPixelBufferAdaptor
-	private let stillTimeInput: AVAssetWriterInput?
-	private let stillTimeAdaptor: AVAssetWriterInputMetadataAdaptor?
+	/// The Live Photo's metadata tracks, which the Lock Screen needs before the wallpaper moves
+	private let live: Live?
+	private let frameDuration: CMTime
+
+	private struct Live {
+		let info: AVAssetWriterInput
+		let infoFormat: CMFormatDescription
+		let still: AVAssetWriterInput
+		let stillFormat: CMFormatDescription
+	}
 	/// Copied audio, when a video had sound
 	let audioInput: AVAssetWriterInput?
 
@@ -50,15 +59,29 @@ final class DitherMovieWriter {
 		writer = try AVAssetWriter(outputURL: url, fileType: .mov)
 		// Dither is all edges, so it needs far more bits than camera footage to stay crisp
 		let bitsPerSecond = Double(self.width * self.height) * frameRate * 0.9
-		input = AVAssetWriterInput(mediaType: .video, outputSettings: [
+		frameDuration = CMTime(seconds: 1 / max(1, frameRate), preferredTimescale: 600)
+		var compression: [String: Any] = [
+			AVVideoAverageBitRateKey: min(bitsPerSecond, 120_000_000),
+			AVVideoExpectedSourceFrameRateKey: frameRate,
+		]
+		var settings: [String: Any] = [
 			AVVideoCodecKey: AVVideoCodecType.hevc,
 			AVVideoWidthKey: self.width,
 			AVVideoHeightKey: self.height,
-			AVVideoCompressionPropertiesKey: [
-				AVVideoAverageBitRateKey: min(bitsPerSecond, 120_000_000),
-				AVVideoExpectedSourceFrameRateKey: frameRate,
-			],
-		])
+		]
+		if liveIdentifier != nil {
+			// What the Lock Screen takes: 8-bit HEVC Main in plain SDR, no reordered frames, a key frame every second
+			compression[AVVideoProfileLevelKey] = kVTProfileLevel_HEVC_Main_AutoLevel as String
+			compression[AVVideoMaxKeyFrameIntervalKey] = Int(frameRate.rounded())
+			compression[AVVideoAllowFrameReorderingKey] = false
+			settings[AVVideoColorPropertiesKey] = [
+				AVVideoColorPrimariesKey: AVVideoColorPrimaries_ITU_R_709_2,
+				AVVideoTransferFunctionKey: AVVideoTransferFunction_ITU_R_709_2,
+				AVVideoYCbCrMatrixKey: AVVideoYCbCrMatrix_ITU_R_709_2,
+			]
+		}
+		settings[AVVideoCompressionPropertiesKey] = compression
+		input = AVAssetWriterInput(mediaType: .video, outputSettings: settings)
 		input.expectsMediaDataInRealTime = false
 		adaptor = AVAssetWriterInputPixelBufferAdaptor(assetWriterInput: input, sourcePixelBufferAttributes: [
 			kCVPixelBufferPixelFormatTypeKey as String: kCVPixelFormatType_32BGRA,
@@ -90,45 +113,27 @@ final class DitherMovieWriter {
 			item.key = "com.apple.quicktime.content.identifier" as NSString
 			item.value = liveIdentifier as NSString
 			item.dataType = kCMMetadataBaseDataType_UTF8 as String
-			// What the iPhone's own Live Photos carry; wallpapers look for these before they'll move
-			func tag(_ key: String, _ value: NSNumber, _ type: CFString) -> AVMutableMetadataItem {
-				let tag = AVMutableMetadataItem()
-				tag.keySpace = .quickTimeMetadata
-				tag.key = key as NSString
-				tag.value = value
-				tag.dataType = type as String
-				return tag
-			}
-			writer.metadata = [
-				item,
-				tag("com.apple.quicktime.live-photo.auto", 1, kCMMetadataBaseDataType_UInt8),
-				tag("com.apple.quicktime.live-photo.vitality-score", 1, kCMMetadataBaseDataType_Float32),
-				tag("com.apple.quicktime.live-photo.vitality-scoring-version", 4, kCMMetadataBaseDataType_SInt64),
-			]
+			writer.metadata = [item]
 
-			let specification: [String: Any] = [
-				kCMMetadataFormatDescriptionMetadataSpecificationKey_Identifier as String: "mdta/com.apple.quicktime.still-image-time",
-				kCMMetadataFormatDescriptionMetadataSpecificationKey_DataType as String: kCMMetadataBaseDataType_SInt8 as String,
-			]
-			var description: CMFormatDescription?
-			unsafe CMMetadataFormatDescriptionCreateWithMetadataSpecifications(
-				allocator: kCFAllocatorDefault,
-				metadataType: kCMMetadataFormatType_Boxed,
-				metadataSpecifications: [specification] as CFArray,
-				formatDescriptionOut: &description
-			)
-			let metadataInput = AVAssetWriterInput(mediaType: .metadata, outputSettings: nil, sourceFormatHint: description)
-			if writer.canAdd(metadataInput) {
-				writer.add(metadataInput)
-				stillTimeInput = metadataInput
-				stillTimeAdaptor = AVAssetWriterInputMetadataAdaptor(assetWriterInput: metadataInput)
-			} else {
-				stillTimeInput = nil
-				stillTimeAdaptor = nil
+			let infoFormat = try LivePhotoMetadata.infoFormatDescription()
+			let stillFormat = try LivePhotoMetadata.stillFormatDescription()
+			let info = AVAssetWriterInput(mediaType: .metadata, outputSettings: nil, sourceFormatHint: infoFormat)
+			let still = AVAssetWriterInput(mediaType: .metadata, outputSettings: nil, sourceFormatHint: stillFormat)
+			for metadata in [info, still] {
+				metadata.expectsMediaDataInRealTime = false
+				guard writer.canAdd(metadata) else {
+					throw Failure.cantWrite
+				}
+				writer.add(metadata)
+				// Both describe the video, as the camera's do
+				let referent = AVAssetTrack.AssociationType.metadataReferent.rawValue
+				if metadata.canAddTrackAssociation(withTrackOf: input, type: referent) {
+					metadata.addTrackAssociation(withTrackOf: input, type: referent)
+				}
 			}
+			live = Live(info: info, infoFormat: infoFormat, still: still, stillFormat: stillFormat)
 		} else {
-			stillTimeInput = nil
-			stillTimeAdaptor = nil
+			live = nil
 		}
 
 		guard writer.startWriting() else {
@@ -137,18 +142,17 @@ final class DitherMovieWriter {
 		writer.startSession(atSourceTime: .zero)
 	}
 
-	/// Marks the frame the Live Photo's still was taken from
-	func markStill(at time: CMTime) {
-		guard let stillTimeAdaptor else {
+	/// Marks the frame the Live Photo's still is taken from. Call before the first frame; the Lock Screen
+	/// wants it at least half a second in.
+	func markStill(at time: CMTime) throws {
+		guard let live else {
 			return
 		}
-		let item = AVMutableMetadataItem()
-		item.keySpace = .quickTimeMetadata
-		item.key = "com.apple.quicktime.still-image-time" as NSString
-		item.value = 0 as NSNumber
-		item.dataType = kCMMetadataBaseDataType_SInt8 as String
-		stillTimeAdaptor.append(AVTimedMetadataGroup(items: [item], timeRange: CMTimeRange(start: time, duration: CMTime(value: 1, timescale: 100))))
-		stillTimeInput?.markAsFinished()
+		let time = CMTimeConvertScale(time, timescale: LivePhotoMetadata.timescale, method: .roundHalfAwayFromZero)
+		guard live.still.append(try LivePhotoMetadata.stillSample(format: live.stillFormat, at: time)) else {
+			throw writer.error ?? Failure.cantWrite
+		}
+		live.still.markAsFinished()
 	}
 
 	/// Appends one rendered frame. `texture` must be BGRA and CPU-readable, the writer's size.
@@ -180,11 +184,24 @@ final class DitherMovieWriter {
 		guard adaptor.append(buffer, withPresentationTime: time) else {
 			throw writer.error ?? Failure.cantWrite
 		}
+		if let live {
+			// The camera's record, once a frame
+			while !live.info.isReadyForMoreMediaData {
+				if writer.status == .failed {
+					throw writer.error ?? Failure.cantWrite
+				}
+				try await Task.sleep(for: .milliseconds(4))
+			}
+			let time = CMTimeConvertScale(time, timescale: LivePhotoMetadata.timescale, method: .roundHalfAwayFromZero)
+			guard live.info.append(try LivePhotoMetadata.infoSample(format: live.infoFormat, at: time, duration: frameDuration)) else {
+				throw writer.error ?? Failure.cantWrite
+			}
+		}
 	}
 
 	func finish() async throws -> URL {
 		input.markAsFinished()
-		stillTimeInput?.markAsFinished()
+		live?.info.markAsFinished()
 		await writer.finishWriting()
 		guard writer.status == .completed else {
 			throw writer.error ?? Failure.cantWrite
@@ -342,9 +359,17 @@ enum MovieMaker {
 		let seconds = 3.0
 		let frameCount = Int(frameRate * seconds)
 		let stillFrame = frameCount / 2
-		// No bigger than the iPhone's own Live Photos, 1080 by 1920, for the wallpaper's sake.
-		// Still and movie share the size and cells, so the picture doesn't jump when it starts moving.
-		let fit = min(1, 1080 / max(1, min(pixelSize.width, pixelSize.height)), 1920 / max(1, max(pixelSize.width, pixelSize.height)))
+		// The still is the screen's own pixels, cells exactly as shown, since it's what the wallpaper
+		// shows almost all the time. The Lock Screen takes a still bigger than its movie.
+		let stillCell = max(1, Int((CGFloat(configuration.bounded().pixelSize) * scale).rounded()))
+		let stillWidth = Int(pixelSize.width) & ~1
+		let stillHeight = Int(pixelSize.height) & ~1
+		// The movie's long side can't pass 1920. It keeps the still's grid of cells, each a whole, smaller
+		// number of pixels, so it's just as crisp, only coarser; never a blurry scale of the still.
+		let limit = min(1, 1080 / max(1, min(pixelSize.width, pixelSize.height)), 1920 / max(1, max(pixelSize.width, pixelSize.height)))
+		let movieCell = max(1, Int((CGFloat(stillCell) * limit).rounded(.down)))
+		// Only 1-pixel cells, which can't get smaller, fall back to plain scaling
+		let fit = min(limit, CGFloat(movieCell) / CGFloat(stillCell))
 		let writer = try DitherMovieWriter(
 			width: Int((pixelSize.width * fit).rounded()),
 			height: Int((pixelSize.height * fit).rounded()),
@@ -360,13 +385,19 @@ enum MovieMaker {
 			throw Failure.cantRender
 		}
 		renderer.camera = input
-		let descriptor = MTLTextureDescriptor.texture2DDescriptor(pixelFormat: .bgra8Unorm, width: writer.width, height: writer.height, mipmapped: false)
-		descriptor.usage = [.renderTarget, .shaderRead]
-		descriptor.storageMode = .shared
-		guard let target = renderer.device.makeTexture(descriptor: descriptor) else {
+		func texture(width: Int, height: Int) -> (any MTLTexture)? {
+			let descriptor = MTLTextureDescriptor.texture2DDescriptor(pixelFormat: .bgra8Unorm, width: width, height: height, mipmapped: false)
+			descriptor.usage = [.renderTarget, .shaderRead]
+			descriptor.storageMode = .shared
+			return renderer.device.makeTexture(descriptor: descriptor)
+		}
+		guard let target = texture(width: writer.width, height: writer.height),
+		      let stillTarget = texture(width: stillWidth, height: stillHeight)
+		else {
 			throw Failure.cantRender
 		}
-		let cell = max(1, Int((CGFloat(pinned.pixelSize) * scale * fit).rounded()))
+		let cell = movieCell
+		try writer.markStill(at: CMTime(value: CMTimeValue(stillFrame), timescale: CMTimeScale(frameRate)))
 		// The wave only moves at its own frame rate; between its steps, frames repeat
 		let waveStep = 1 / Double(max(1, pinned.framesPerSecond))
 		var still: CGImage?
@@ -378,8 +409,8 @@ enum MovieMaker {
 			try renderer.render(to: target, width: writer.width, height: writer.height, cell: cell, configuration: pinned, advance: false, atTime: time)
 			let presentation = CMTime(value: CMTimeValue(frame), timescale: CMTimeScale(frameRate))
 			if frame == stillFrame {
-				still = image(of: target)
-				writer.markStill(at: presentation)
+				try renderer.render(to: stillTarget, width: stillWidth, height: stillHeight, cell: stillCell, configuration: pinned, advance: false, atTime: time)
+				still = image(of: stillTarget)
 			}
 			try await writer.append(target, at: presentation)
 			await Task.yield()

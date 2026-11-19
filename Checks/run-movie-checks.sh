@@ -15,6 +15,7 @@ xcrun swiftc -O -parse-as-library -default-isolation MainActor \
 	"$root/Bayer/Camera/PhotoLibrary.swift" \
 	"$root/Bayer/Camera/EditData.swift" \
 	"$root/Bayer/Camera/VideoDither.swift" \
+	"$root/Bayer/Camera/LivePhotoMetadata.swift" \
 	"$root/Bayer/Library/FramePixels.swift" \
 	"$root/Bayer/Library/ProSettings.swift" \
 	"$root/Bayer/Library/Look.swift" \
